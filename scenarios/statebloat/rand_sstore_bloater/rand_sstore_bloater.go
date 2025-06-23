@@ -19,7 +19,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/ethpandaops/spamoor/scenarios/statebloat/rand_sstore_bloater/contract"
-	"github.com/ethpandaops/spamoor/scenariotypes"
+	"github.com/ethpandaops/spamoor/scenario"
 	"github.com/ethpandaops/spamoor/spamoor"
 )
 
@@ -40,8 +40,8 @@ const (
 
 	// Gas cost per iteration (measured from actual transactions)
 	// Includes: SSTORE (0→non-zero), MULMOD, loop overhead, stack operations
-	// Measured: 22,165 gas per iteration
-	GasPerNewSlotIteration = uint64(22165)
+	// Based on observed usage with small buffer
+	GasPerNewSlotIteration = uint64(23000)
 
 	// Contract deployment and call overhead
 	EstimatedDeployGas = uint64(500000) // Deployment gas for our contract
@@ -104,14 +104,14 @@ var ScenarioDefaultOptions = ScenarioOptions{
 	BaseFee: 10, // 10 gwei default
 	TipFee:  2,  // 2 gwei default
 }
-var ScenarioDescriptor = scenariotypes.ScenarioDescriptor{
+var ScenarioDescriptor = scenario.Descriptor{
 	Name:           ScenarioName,
 	Description:    "Maximum state bloat via SSTORE operations using curve25519 prime dispersion",
 	DefaultOptions: ScenarioDefaultOptions,
 	NewScenario:    newScenario,
 }
 
-func newScenario(logger logrus.FieldLogger) scenariotypes.Scenario {
+func newScenario(logger logrus.FieldLogger) scenario.Scenario {
 	return &Scenario{
 		logger:                       logger.WithField("scenario", ScenarioName),
 		actualGasPerNewSlotIteration: GasPerNewSlotIteration, // Start with estimated values
@@ -125,11 +125,11 @@ func (s *Scenario) Flags(flags *pflag.FlagSet) error {
 	return nil
 }
 
-func (s *Scenario) Init(walletPool *spamoor.WalletPool, config string) error {
-	s.walletPool = walletPool
+func (s *Scenario) Init(options *scenario.Options) error {
+	s.walletPool = options.WalletPool
 
-	if config != "" {
-		err := yaml.Unmarshal([]byte(config), &s.options)
+	if options.Config != "" {
+		err := yaml.Unmarshal([]byte(options.Config), &s.options)
 		if err != nil {
 			return fmt.Errorf("failed to unmarshal config: %w", err)
 		}
@@ -223,15 +223,21 @@ func (s *Scenario) deployContract(ctx context.Context) error {
 		return err
 	}
 
-	auth, err := bind.NewKeyedTransactorWithChainID(wallet.GetPrivateKey(), chainID)
+	auth, err := bind.NewKeyedTransactorWithChainID(wallet.GetWallet().GetPrivateKey(), chainID)
 	if err != nil {
 		return fmt.Errorf("failed to create transactor: %w", err)
 	}
 
+	// Get suggested fees from the network
+	feeCap, tipCap, err := s.walletPool.GetTxPool().GetSuggestedFees(client, s.options.BaseFee, s.options.TipFee)
+	if err != nil {
+		return fmt.Errorf("failed to get suggested fees: %w", err)
+	}
+
 	// Set gas parameters
 	auth.GasLimit = EstimatedDeployGas
-	auth.GasFeeCap = new(big.Int).Mul(big.NewInt(int64(s.options.BaseFee)), big.NewInt(1000000000))
-	auth.GasTipCap = new(big.Int).Mul(big.NewInt(int64(s.options.TipFee)), big.NewInt(1000000000))
+	auth.GasFeeCap = feeCap
+	auth.GasTipCap = tipCap
 
 	// Deploy contract using generated bindings
 	address, tx, contractInstance, err := contract.DeployContract(auth, client.GetEthClient())
@@ -334,6 +340,17 @@ func (s *Scenario) executeCreateSlots(ctx context.Context, targetGas uint64, blo
 		return fmt.Errorf("not enough gas to create any slots")
 	}
 
+	// Safety check: cap slots to a reasonable maximum to avoid edge cases
+	maxSlotsPerTx := uint64(5200) // Adjusted limit based on observed performance
+	if slotsToCreate > maxSlotsPerTx {
+		s.logger.Warnf("Capping slots from %d to %d for safety", slotsToCreate, maxSlotsPerTx)
+		slotsToCreate = maxSlotsPerTx
+	}
+
+	// Log gas calculations for debugging
+	s.logger.Debugf("Gas calculations: targetGas=%d, availableGas=%d, gasPerSlot=%d, slotsToCreate=%d",
+		targetGas, availableGas, s.actualGasPerNewSlotIteration, slotsToCreate)
+
 	// Get client and wallet
 	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, "")
 	if client == nil {
@@ -351,23 +368,29 @@ func (s *Scenario) executeCreateSlots(ctx context.Context, targetGas uint64, blo
 		return err
 	}
 
-	auth, err := bind.NewKeyedTransactorWithChainID(wallet.GetPrivateKey(), chainID)
+	auth, err := bind.NewKeyedTransactorWithChainID(wallet.GetWallet().GetPrivateKey(), chainID)
 	if err != nil {
 		return fmt.Errorf("failed to create transactor: %w", err)
 	}
 
+	// Get suggested fees from the network
+	feeCap, tipCap, err := s.walletPool.GetTxPool().GetSuggestedFees(client, s.options.BaseFee, s.options.TipFee)
+	if err != nil {
+		return fmt.Errorf("failed to get suggested fees: %w", err)
+	}
+
 	// Set gas parameters
 	auth.GasLimit = targetGas
-	auth.GasFeeCap = new(big.Int).Mul(big.NewInt(int64(s.options.BaseFee)), big.NewInt(1000000000))
-	auth.GasTipCap = new(big.Int).Mul(big.NewInt(int64(s.options.TipFee)), big.NewInt(1000000000))
+	auth.GasFeeCap = feeCap
+	auth.GasTipCap = tipCap
 
 	// Execute transaction using contract bindings
 	tx, err := s.contractInstance.CreateSlots(auth, big.NewInt(int64(slotsToCreate)))
 	if err != nil {
 		// Check if it's an out-of-gas error
 		if strings.Contains(err.Error(), "out of gas") || strings.Contains(err.Error(), "OutOfGas") {
-			// Increase our gas estimate by 10%
-			s.actualGasPerNewSlotIteration = uint64(float64(s.actualGasPerNewSlotIteration) * 1.1)
+			// Increase our gas estimate by 20% for faster adaptation
+			s.actualGasPerNewSlotIteration = uint64(float64(s.actualGasPerNewSlotIteration) * 1.2)
 			s.logger.Warnf("Out of gas error detected. Adjusting gas per slot estimate to %d", s.actualGasPerNewSlotIteration)
 		}
 		return err
@@ -393,7 +416,15 @@ func (s *Scenario) executeCreateSlots(ctx context.Context, targetGas uint64, blo
 
 	// Update our gas estimate using exponential moving average
 	// New estimate = 0.7 * old estimate + 0.3 * actual
-	s.actualGasPerNewSlotIteration = uint64(float64(s.actualGasPerNewSlotIteration)*0.7 + float64(actualGasPerSlotIteration)*0.3)
+	newEstimate := uint64(float64(s.actualGasPerNewSlotIteration)*0.7 + float64(actualGasPerSlotIteration)*0.3)
+	
+	// Ensure we don't go below a safe minimum (with 5% buffer over actual)
+	minSafeEstimate := uint64(float64(actualGasPerSlotIteration) * 1.05)
+	if newEstimate < minSafeEstimate {
+		newEstimate = minSafeEstimate
+	}
+	
+	s.actualGasPerNewSlotIteration = newEstimate
 
 	// Get previous block info for tracking
 	prevBlockNumber := receipt.BlockNumber.Uint64() - 1
