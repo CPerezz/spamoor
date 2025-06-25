@@ -34,6 +34,7 @@ type ScenarioOptions struct {
 	TipFee          uint64 `yaml:"tip_fee"`
 	ClientGroup     string `yaml:"client_group"`
 	MaxTransactions uint64 `yaml:"max_transactions"`
+	RateLimitPercent uint64 `yaml:"rate_limit_percent"`
 }
 
 // ContractDeployment tracks a deployed contract with its deployer info
@@ -92,6 +93,7 @@ var ScenarioDefaultOptions = ScenarioOptions{
 	BaseFee:         5,   // Moderate base fee (5 gwei)
 	TipFee:          1,   // Priority fee (1 gwei)
 	MaxTransactions: 0,
+	RateLimitPercent: 90, // Use 90% of block capacity by default
 }
 var ScenarioDescriptor = scenario.Descriptor{
 	Name:           ScenarioName,
@@ -114,6 +116,7 @@ func (s *Scenario) Flags(flags *pflag.FlagSet) error {
 	flags.Uint64Var(&s.options.TipFee, "tipfee", ScenarioDefaultOptions.TipFee, "Tip fee per gas in gwei")
 	flags.StringVar(&s.options.ClientGroup, "client-group", ScenarioDefaultOptions.ClientGroup, "Client group to use for sending transactions")
 	flags.Uint64Var(&s.options.MaxTransactions, "max-transactions", ScenarioDefaultOptions.MaxTransactions, "Maximum number of transactions to send (0 = use rate limiting based on block gas limit)")
+	flags.Uint64Var(&s.options.RateLimitPercent, "rate-limit-percent", ScenarioDefaultOptions.RateLimitPercent, "Percentage of block capacity to use (1-100)")
 	return nil
 }
 
@@ -388,6 +391,13 @@ func (s *Scenario) startBlockMonitor(ctx context.Context) {
 						totalContracts := len(s.deployedContracts)
 						s.contractsMutex.Unlock()
 
+						// Calculate block utilization if we know the gas limit
+						var utilizationStr string
+						if latestBlock != nil && latestBlock.GasLimit() > 0 {
+							utilization := float64(stats.TotalGasUsed) / float64(latestBlock.GasLimit()) * 100
+							utilizationStr = fmt.Sprintf("%.1f%%", utilization)
+						}
+
 						s.logger.WithFields(logrus.Fields{
 							"block_number":        bn,
 							"contracts_deployed":  stats.ContractCount,
@@ -395,6 +405,7 @@ func (s *Scenario) startBlockMonitor(ctx context.Context) {
 							"total_bytecode_size": stats.TotalBytecodeSize,
 							"avg_gas_per_byte":    fmt.Sprintf("%.2f", avgGasPerByte),
 							"total_contracts":     totalContracts,
+							"block_utilization":   utilizationStr,
 						}).Info("Block deployment summary")
 
 						s.lastLoggedBlock = bn
@@ -446,19 +457,18 @@ func (s *Scenario) Run(ctx context.Context) error {
 	}
 
 	// Calculate rate limiting based on block gas limit if max-transactions is 0
-	var maxTxsPerBlock uint64
+	var expectedThroughput uint64
 	var useRateLimiting bool
 
 	if s.options.MaxTransactions == 0 {
 		blockGasLimit := currentBlock.GasLimit()
 		// TODO: This should be a constant.
 		estimatedGasPerContract := uint64(4949468) // Updated estimate based on contract size reduction
-		expectedThroughput := blockGasLimit / estimatedGasPerContract
-		maxTxsPerBlock = expectedThroughput * 2 // Set rate limit to 2x expected throughput
+		expectedThroughput = blockGasLimit / estimatedGasPerContract
 		useRateLimiting = true
 
-		s.logger.Infof("Rate limiting enabled: block gas limit %d, gas per contract %d, expected throughput %d, rate limit %d txs/block",
-			blockGasLimit, estimatedGasPerContract, expectedThroughput, maxTxsPerBlock)
+		s.logger.Infof("Rate limiting enabled: block gas limit %d, gas per contract %d, expected throughput %d contracts/block",
+			blockGasLimit, estimatedGasPerContract, expectedThroughput)
 	}
 
 	txIdxCounter := uint64(0)
@@ -475,9 +485,17 @@ func (s *Scenario) Run(ctx context.Context) error {
 
 		// Rate limiting logic
 		if useRateLimiting {
-			// If we've sent expected throughput transactions, wait for next block
-			if blockTxCount >= maxTxsPerBlock/2 { // Send throughput amount, not rate limit amount
-				s.logger.Infof("Sent %d txs, waiting for next block", blockTxCount)
+			// Use configured percentage of expected throughput to avoid overflowing blocks
+			rateLimitPercent := s.options.RateLimitPercent
+			if rateLimitPercent == 0 || rateLimitPercent > 100 {
+				rateLimitPercent = 90 // Default to 90% if invalid
+			}
+			targetTxsPerBlock := expectedThroughput * rateLimitPercent / 100
+			if blockTxCount >= targetTxsPerBlock {
+				// Calculate block utilization percentage
+				blockUtilization := float64(blockTxCount) / float64(expectedThroughput) * 100
+				s.logger.Infof("Sent %d txs (target: %d [%d%%], max capacity: %d, block utilization: %.1f%%), waiting for next block", 
+					blockTxCount, targetTxsPerBlock, rateLimitPercent, expectedThroughput, blockUtilization)
 				
 				// Wait for block number to change
 				for {
