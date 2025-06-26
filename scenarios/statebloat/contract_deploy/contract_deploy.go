@@ -93,6 +93,12 @@ type Scenario struct {
 	// Original gas prices for escalation
 	originalBaseFee uint64
 	originalTipFee  uint64
+
+	// Deadlock prevention counters
+	consecutiveEmptyBlocks    uint64
+	consecutiveFailedBlockWaits uint64
+	emptyBlockRetryCount      uint64
+	maxGasPriceReached        bool
 }
 
 var ScenarioName = "contract-deploy"
@@ -287,20 +293,8 @@ func (s *Scenario) processPendingTransactions(ctx context.Context) {
 	}
 
 	// Trigger gas price escalation if we have stuck transactions
-	if len(stuckTxs) > 0 {
-		s.logger.Warnf("Detected %d stuck transactions (>30s), escalating gas prices", len(stuckTxs))
-		// Release lock before calling escalation
-		s.pendingTxsMutex.Unlock()
-		
-		err := s.updateDynamicFeesWithEscalation(ctx, true)
-		if err != nil {
-			s.logger.Warnf("Failed to escalate gas prices: %v", err)
-		}
-		
-		// Re-acquire lock to continue processing
-		s.pendingTxsMutex.Lock()
-	}
-
+	escalationNeeded := len(stuckTxs) > 0
+	
 	// Remove confirmed transactions from pending map
 	for _, txHash := range confirmedTxs {
 		delete(s.pendingTxs, txHash)
@@ -313,7 +307,24 @@ func (s *Scenario) processPendingTransactions(ctx context.Context) {
 
 	s.pendingTxsMutex.Unlock()
 
-	// Process successful deployments after releasing the lock
+	// Handle gas price escalation outside of mutex lock to prevent deadlock
+	if escalationNeeded {
+		s.logger.Warnf("Detected %d stuck transactions (>30s), escalating gas prices", len(stuckTxs))
+		
+		// Create timeout context for escalation to prevent hanging
+		escalationCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		
+		err := s.updateDynamicFeesWithEscalation(escalationCtx, true)
+		if err != nil {
+			s.logger.Warnf("Failed to escalate gas prices: %v", err)
+		} else {
+			// Trigger immediate transaction sending with escalated prices
+			s.triggerImmediateTxSending(ctx, len(stuckTxs))
+		}
+	}
+
+	// Process successful deployments
 	for _, deployment := range successfulDeployments {
 		s.recordDeployedContract(deployment.ContractAddress, deployment.PrivateKey, deployment.Receipt, deployment.TxHash)
 	}
@@ -544,7 +555,16 @@ func (s *Scenario) Run(ctx context.Context) error {
 	lastBlockNumber := currentBlock.Number().Uint64()
 
 	// Main loop for alternating wallet groups
+	loopIteration := uint64(0)
 	for {
+		loopIteration++
+		
+		// Enhanced monitoring every 10 iterations
+		if loopIteration%10 == 0 {
+			s.logger.Infof("DEADLOCK MONITORING: Loop iteration %d, empty blocks: %d, failed waits: %d, retry count: %d, max gas reached: %v",
+				loopIteration, s.consecutiveEmptyBlocks, s.consecutiveFailedBlockWaits, s.emptyBlockRetryCount, s.maxGasPriceReached)
+		}
+		
 		// Check if we've reached max transactions (if set)
 		if s.options.MaxTransactions > 0 && txIdxCounter >= s.options.MaxTransactions {
 			s.logger.Infof("reached maximum number of transactions (%d)", s.options.MaxTransactions)
@@ -555,6 +575,15 @@ func (s *Scenario) Run(ctx context.Context) error {
 		if s.walletsPerGroup == 0 {
 			s.logger.Error("No wallet groups configured")
 			break
+		}
+		
+		// Automatic recovery if too many consecutive failures
+		if s.consecutiveFailedBlockWaits > 10 {
+			s.logger.Errorf("AUTOMATIC RECOVERY: Too many consecutive failed block waits (%d), resetting counters",
+				s.consecutiveFailedBlockWaits)
+			s.consecutiveFailedBlockWaits = 0
+			s.consecutiveEmptyBlocks = 0
+			s.emptyBlockRetryCount = 0
 		}
 
 		// Send batch of transactions for current wallet group
@@ -582,12 +611,27 @@ func (s *Scenario) Run(ctx context.Context) error {
 		// Wait for block number to change before switching groups
 		s.logger.Info("Waiting for next block...")
 		waitStartTime := time.Now()
+		maxWaitTime := 2 * time.Minute // Maximum wait time before forcing progression
+		
 		for {
 			// Check if context is cancelled
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
+			}
+
+			// Check if we've exceeded maximum wait time
+			waitDuration := time.Since(waitStartTime)
+			if waitDuration > maxWaitTime {
+				s.consecutiveFailedBlockWaits++
+				s.logger.Errorf("DEADLOCK PREVENTION: Forcing progression after %v wait (failed waits: %d)", 
+					waitDuration, s.consecutiveFailedBlockWaits)
+				
+				// Force progression to next wallet group to prevent deadlock
+				s.currentWalletGroup = (s.currentWalletGroup + 1) % 10
+				s.logger.Warnf("Forced switch to wallet group %d to prevent deadlock", s.currentWalletGroup)
+				break
 			}
 
 			currentBlock, err := ethClient.BlockByNumber(ctx, nil)
@@ -600,36 +644,58 @@ func (s *Scenario) Run(ctx context.Context) error {
 			currentBlockNum := currentBlock.Number().Uint64()
 			if currentBlockNum > lastBlockNumber {
 				lastBlockNumber = currentBlockNum
+				s.consecutiveFailedBlockWaits = 0 // Reset counter on successful block progression
 
 				// Check if this block is empty (no transactions)
 				blockTxCount := len(currentBlock.Transactions())
 				if blockTxCount == 0 {
-					s.logger.Warnf("Block %d is EMPTY (0 transactions), escalating gas prices and retrying immediately", 
-						lastBlockNumber)
+					s.consecutiveEmptyBlocks++
+					s.logger.Warnf("Block %d is EMPTY (0 transactions), consecutive empty blocks: %d", 
+						lastBlockNumber, s.consecutiveEmptyBlocks)
 					
-					// Escalate gas prices due to empty block
-					err := s.updateDynamicFeesWithEscalation(ctx, true)
-					if err != nil {
-						s.logger.Warnf("Failed to escalate gas prices after empty block: %v", err)
-					}
-					
-					// Immediately send transactions with new gas prices (skip waiting for next block)
-					groupStartIdx := s.currentWalletGroup * s.walletsPerGroup
-					groupEndIdx := groupStartIdx + s.walletsPerGroup
-					
-					s.logger.Infof("RETRYING transactions for wallet group %d of 10 (wallets %d-%d) with escalated prices",
-						s.currentWalletGroup, groupStartIdx, groupEndIdx-1)
-					
-					// Send batch with escalated prices
-					err = s.sendBatchTransactions(ctx, txIdxCounter, groupStartIdx, groupEndIdx)
-					if err != nil {
-						s.logger.Errorf("Failed to send retry batch after empty block: %v", err)
+					// Circuit breaker: if too many consecutive empty blocks, stop retrying
+					if s.consecutiveEmptyBlocks > 5 {
+						s.logger.Errorf("CIRCUIT BREAKER: Too many consecutive empty blocks (%d), skipping retry to prevent deadlock", 
+							s.consecutiveEmptyBlocks)
+					} else if s.emptyBlockRetryCount < 3 && !s.maxGasPriceReached {
+						// Limited retries per empty block
+						s.emptyBlockRetryCount++
+						
+						// Escalate gas prices due to empty block
+						err := s.updateDynamicFeesWithEscalation(ctx, true)
+						if err != nil {
+							s.logger.Warnf("Failed to escalate gas prices after empty block: %v", err)
+						}
+						
+						// Add cooldown to prevent excessive retries
+						s.logger.Infof("Adding 10-second cooldown before retry (attempt %d/3)", s.emptyBlockRetryCount)
+						time.Sleep(10 * time.Second)
+						
+						// Immediately send transactions with new gas prices (skip waiting for next block)
+						groupStartIdx := s.currentWalletGroup * s.walletsPerGroup
+						groupEndIdx := groupStartIdx + s.walletsPerGroup
+						
+						s.logger.Infof("RETRYING transactions for wallet group %d of 10 (wallets %d-%d) with escalated prices",
+							s.currentWalletGroup, groupStartIdx, groupEndIdx-1)
+						
+						// Send batch with escalated prices
+						err = s.sendBatchTransactions(ctx, txIdxCounter, groupStartIdx, groupEndIdx)
+						if err != nil {
+							s.logger.Errorf("Failed to send retry batch after empty block: %v", err)
+						} else {
+							// Update counters for the retry batch
+							sentCount := groupEndIdx - groupStartIdx
+							txIdxCounter += sentCount
+							totalTxCount.Add(sentCount)
+						}
 					} else {
-						// Update counters for the retry batch
-						sentCount := groupEndIdx - groupStartIdx
-						txIdxCounter += sentCount
-						totalTxCount.Add(sentCount)
+						s.logger.Warnf("Skipping empty block retry (attempts: %d/3, max gas reached: %v)", 
+							s.emptyBlockRetryCount, s.maxGasPriceReached)
 					}
+				} else {
+					// Block has transactions - reset empty block counters
+					s.consecutiveEmptyBlocks = 0
+					s.emptyBlockRetryCount = 0
 				}
 
 				// Rotate to the next wallet group (0-9)
@@ -641,7 +707,6 @@ func (s *Scenario) Run(ctx context.Context) error {
 			}
 
 			// Log if we've been waiting too long
-			waitDuration := time.Since(waitStartTime)
 			if waitDuration > 30*time.Second {
 				s.logger.Warnf("Been waiting for new block for %v, current block: %d, waiting for block > %d",
 					waitDuration, currentBlockNum, lastBlockNumber)
@@ -831,6 +896,17 @@ func (s *Scenario) updateDynamicFeesWithEscalation(ctx context.Context, escalate
 	}
 
 	if escalate {
+		// Check if we've reached maximum gas price limits (prevent infinite escalation)
+		maxBaseFee := uint64(1000) // 1000 gwei max base fee
+		maxTipFee := uint64(100)   // 100 gwei max tip fee
+		
+		if s.options.BaseFee >= maxBaseFee || s.options.TipFee >= maxTipFee {
+			s.maxGasPriceReached = true
+			s.logger.Errorf("ESCALATION LIMIT: Maximum gas prices reached (base: %d/%d gwei, tip: %d/%d gwei), stopping escalation",
+				s.options.BaseFee, maxBaseFee, s.options.TipFee, maxTipFee)
+			return fmt.Errorf("maximum gas price limit reached")
+		}
+		
 		// Aggressive escalation: add original fees to current fees
 		oldBaseFee := s.options.BaseFee
 		oldTipFee := s.options.TipFee
@@ -838,9 +914,24 @@ func (s *Scenario) updateDynamicFeesWithEscalation(ctx context.Context, escalate
 		s.options.BaseFee = s.options.BaseFee + s.originalBaseFee
 		s.options.TipFee = s.options.TipFee + s.originalTipFee
 
+		// Check if we've exceeded limits after escalation
+		if s.options.BaseFee > maxBaseFee {
+			s.options.BaseFee = maxBaseFee
+			s.maxGasPriceReached = true
+		}
+		if s.options.TipFee > maxTipFee {
+			s.options.TipFee = maxTipFee
+			s.maxGasPriceReached = true
+		}
+
 		s.logger.Warnf("ESCALATING gas prices due to stuck transactions - Base fee: %d -> %d gwei (+%d), Tip fee: %d -> %d gwei (+%d)",
 			oldBaseFee, s.options.BaseFee, s.originalBaseFee,
 			oldTipFee, s.options.TipFee, s.originalTipFee)
+		
+		if s.maxGasPriceReached {
+			s.logger.Warnf("Gas price escalation has reached maximum limits")
+		}
+		
 		return nil
 	}
 
@@ -872,6 +963,41 @@ func (s *Scenario) updateDynamicFeesWithEscalation(ctx context.Context, escalate
 	}
 
 	return nil
+}
+
+// triggerImmediateTxSending forces immediate transaction sending with escalated gas prices
+func (s *Scenario) triggerImmediateTxSending(ctx context.Context, stuckTxCount int) {
+	s.logger.Warnf("FORCING immediate transaction sending due to %d stuck transactions", stuckTxCount)
+	
+	// Start from wallet group 0 and send transactions for all groups
+	for groupIdx := uint64(0); groupIdx < 10; groupIdx++ {
+		groupStartIdx := groupIdx * s.walletsPerGroup
+		groupEndIdx := groupStartIdx + s.walletsPerGroup
+		
+		s.logger.Infof("FORCING transactions for wallet group %d of 10 (wallets %d-%d) with escalated prices",
+			groupIdx, groupStartIdx, groupEndIdx-1)
+		
+		// Send batch with escalated prices
+		err := s.sendBatchTransactions(ctx, 0, groupStartIdx, groupEndIdx) // Use 0 for baseIdx since we're forcing
+		if err != nil {
+			s.logger.Errorf("Failed to send forced batch for group %d: %v", groupIdx, err)
+		} else {
+			s.logger.Infof("Successfully sent forced batch for wallet group %d", groupIdx)
+		}
+		
+		// Small delay between groups to avoid overwhelming the network
+		time.Sleep(1 * time.Second)
+		
+		// Check context cancellation between groups
+		select {
+		case <-ctx.Done():
+			s.logger.Warnf("Context cancelled during forced transaction sending")
+			return
+		default:
+		}
+	}
+	
+	s.logger.Infof("Completed forced transaction sending across all 10 wallet groups")
 }
 
 // attemptTransaction makes a single attempt to send a transaction
