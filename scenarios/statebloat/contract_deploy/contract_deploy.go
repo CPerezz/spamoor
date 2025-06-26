@@ -177,6 +177,35 @@ func (s *Scenario) Init(options *scenario.Options) error {
 		s.walletPool.SetWalletCount(10)
 	}
 
+	// Force wallet preparation to ensure they exist before nonce reset
+	err := s.walletPool.PrepareWallets()
+	if err != nil {
+		return fmt.Errorf("failed to prepare wallets: %w", err)
+	}
+
+	// Reset nonces for all child wallets to sync with blockchain state
+	// This prevents conflicts with leftover pending transactions from previous runs
+	s.logger.Info("Resetting wallet nonces to sync with blockchain state...")
+	walletCount := s.walletPool.GetWalletCount()
+	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, s.options.ClientGroup)
+	if client == nil {
+		return fmt.Errorf("no client available for nonce reset")
+	}
+
+	ctx := context.Background()
+	for i := uint64(0); i < walletCount; i++ {
+		wallet := s.walletPool.GetWallet(spamoor.SelectWalletByIndex, int(i))
+		if wallet != nil {
+			oldNonce := wallet.GetNonce()
+			wallet.ResetPendingNonce(ctx, client)
+			newNonce := wallet.GetNonce()
+			if oldNonce != newNonce {
+				s.logger.Infof("Reset wallet %d nonce from %d to %d", i, oldNonce, newNonce)
+			}
+		}
+	}
+	s.logger.Info("Completed wallet nonce reset")
+
 	return nil
 }
 
@@ -657,11 +686,51 @@ func (s *Scenario) sendBatchTransactions(ctx context.Context, baseIdx, startIdx,
 // sendTransaction sends a single contract deployment transaction
 func (s *Scenario) sendTransaction(ctx context.Context, txIdx uint64) error {
 	maxRetries := 3
+	maxNonceSkips := 5
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		err := s.attemptTransaction(ctx, txIdx, attempt)
 		if err == nil {
 			return nil
+		}
+
+		// Check if it's a nonce conflict error (replacement transaction underpriced)
+		if strings.Contains(err.Error(), "replacement transaction underpriced") {
+			s.logger.Warnf("Transaction %d nonce conflict detected, skipping to next nonce (attempt %d/%d)",
+				txIdx, attempt+1, maxRetries)
+
+			// Get the wallet and skip the conflicting nonce
+			wallet := s.walletPool.GetWallet(spamoor.SelectWalletByIndex, int(txIdx))
+			if wallet != nil {
+				skippedNonces := 0
+				for skippedNonces < maxNonceSkips {
+					oldNonce := wallet.GetNonce()
+					newNonce := wallet.GetNextNonce() // Skip the conflicting nonce
+					s.logger.Infof("Wallet %d skipped nonce %d, now using nonce %d", 
+						txIdx, oldNonce, newNonce)
+					skippedNonces++
+
+					// Retry with the new nonce
+					err = s.attemptTransaction(ctx, txIdx, attempt)
+					if err == nil {
+						return nil
+					}
+
+					// If still getting nonce conflict, continue skipping
+					if !strings.Contains(err.Error(), "replacement transaction underpriced") {
+						break
+					}
+				}
+
+				if skippedNonces >= maxNonceSkips {
+					s.logger.Errorf("Wallet %d exceeded maximum nonce skips (%d), giving up", 
+						txIdx, maxNonceSkips)
+					return fmt.Errorf("exceeded maximum nonce skips (%d) for wallet %d", maxNonceSkips, txIdx)
+				}
+			}
+
+			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond) // Short backoff for nonce conflicts
+			continue
 		}
 
 		// Check if it's a base fee error
