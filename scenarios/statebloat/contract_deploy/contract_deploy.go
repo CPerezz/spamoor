@@ -161,12 +161,12 @@ func (s *Scenario) Init(options *scenario.Options) error {
 		}
 		contractsPerGroup := (maxContractsPerBlock * rateLimitPercent) / 100
 
-		// Create 2x the number of wallets we need per group
-		// This allows us to alternate between two groups
-		totalWallets := contractsPerGroup * 2
+		// Create 10x the number of wallets we need per group
+		// This allows us to cycle through 10 groups, giving each wallet more time between uses
+		totalWallets := contractsPerGroup * 10
 		s.walletsPerGroup = contractsPerGroup
 
-		s.logger.Infof("Rate limiting mode: creating %d wallets (%d per group for %d%% of %d max contracts/block)",
+		s.logger.Infof("Rate limiting mode: creating %d wallets (%d per group across 10 groups for %d%% of %d max contracts/block)",
 			totalWallets, s.walletsPerGroup, rateLimitPercent, maxContractsPerBlock)
 
 		s.walletPool.SetWalletCount(totalWallets)
@@ -499,7 +499,7 @@ func (s *Scenario) Run(ctx context.Context) error {
 		groupStartIdx := s.currentWalletGroup * s.walletsPerGroup
 		groupEndIdx := groupStartIdx + s.walletsPerGroup
 
-		s.logger.Infof("Sending transactions for wallet group %d (wallets %d-%d)",
+		s.logger.Infof("Sending transactions for wallet group %d of 10 (wallets %d-%d)",
 			s.currentWalletGroup, groupStartIdx, groupEndIdx-1)
 
 		// Send all transactions for this group in parallel
@@ -539,8 +539,8 @@ func (s *Scenario) Run(ctx context.Context) error {
 			if currentBlockNum > lastBlockNumber {
 				lastBlockNumber = currentBlockNum
 
-				// Toggle wallet group for the new block
-				s.currentWalletGroup = (s.currentWalletGroup + 1) % 2
+				// Rotate to the next wallet group (0-9)
+				s.currentWalletGroup = (s.currentWalletGroup + 1) % 10
 				s.logger.Infof("New block %d: switching to wallet group %d",
 					lastBlockNumber, s.currentWalletGroup)
 
