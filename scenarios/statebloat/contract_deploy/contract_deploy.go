@@ -89,6 +89,10 @@ type Scenario struct {
 	// Wallet group management for rate limiting
 	currentWalletGroup uint64
 	walletsPerGroup    uint64
+
+	// Original gas prices for escalation
+	originalBaseFee uint64
+	originalTipFee  uint64
 }
 
 var ScenarioName = "contract-deploy"
@@ -235,6 +239,7 @@ func (s *Scenario) processPendingTransactions(ctx context.Context) {
 	ethClient := client.GetEthClient()
 	var confirmedTxs []common.Hash
 	var timedOutTxs []common.Hash
+	var stuckTxs []common.Hash
 	var successfulDeployments []struct {
 		ContractAddress common.Address
 		PrivateKey      *ecdsa.PrivateKey
@@ -243,8 +248,15 @@ func (s *Scenario) processPendingTransactions(ctx context.Context) {
 	}
 
 	for txHash, pendingTx := range s.pendingTxs {
+		timeSinceSent := time.Since(pendingTx.Timestamp)
+		
+		// Check if transaction is stuck (>30 seconds without confirmation)
+		if timeSinceSent > 30*time.Second && timeSinceSent <= 1*time.Minute {
+			stuckTxs = append(stuckTxs, txHash)
+		}
+		
 		// Check if transaction is too old (1 minute timeout)
-		if time.Since(pendingTx.Timestamp) > 1*time.Minute {
+		if timeSinceSent > 1*time.Minute {
 			s.logger.Warnf("Transaction %s timed out after 1 minute, removing from pending", txHash.Hex())
 			timedOutTxs = append(timedOutTxs, txHash)
 			continue
@@ -272,6 +284,21 @@ func (s *Scenario) processPendingTransactions(ctx context.Context) {
 				TxHash:          txHash,
 			})
 		}
+	}
+
+	// Trigger gas price escalation if we have stuck transactions
+	if len(stuckTxs) > 0 {
+		s.logger.Warnf("Detected %d stuck transactions (>30s), escalating gas prices", len(stuckTxs))
+		// Release lock before calling escalation
+		s.pendingTxsMutex.Unlock()
+		
+		err := s.updateDynamicFeesWithEscalation(ctx, true)
+		if err != nil {
+			s.logger.Warnf("Failed to escalate gas prices: %v", err)
+		}
+		
+		// Re-acquire lock to continue processing
+		s.pendingTxsMutex.Lock()
 	}
 
 	// Remove confirmed transactions from pending map
@@ -481,6 +508,12 @@ func (s *Scenario) Run(ctx context.Context) error {
 	s.logger.Infof("starting scenario: %s", ScenarioName)
 	defer s.logger.Infof("scenario %s finished.", ScenarioName)
 
+	// Store original gas prices for escalation
+	s.originalBaseFee = s.options.BaseFee
+	s.originalTipFee = s.options.TipFee
+	s.logger.Infof("Stored original gas prices - Base fee: %d gwei, Tip fee: %d gwei", 
+		s.originalBaseFee, s.originalTipFee)
+
 	// Start block monitoring for real-time logging
 	s.startBlockMonitor(ctx)
 	defer s.stopBlockMonitor()
@@ -567,6 +600,37 @@ func (s *Scenario) Run(ctx context.Context) error {
 			currentBlockNum := currentBlock.Number().Uint64()
 			if currentBlockNum > lastBlockNumber {
 				lastBlockNumber = currentBlockNum
+
+				// Check if this block is empty (no transactions)
+				blockTxCount := len(currentBlock.Transactions())
+				if blockTxCount == 0 {
+					s.logger.Warnf("Block %d is EMPTY (0 transactions), escalating gas prices and retrying immediately", 
+						lastBlockNumber)
+					
+					// Escalate gas prices due to empty block
+					err := s.updateDynamicFeesWithEscalation(ctx, true)
+					if err != nil {
+						s.logger.Warnf("Failed to escalate gas prices after empty block: %v", err)
+					}
+					
+					// Immediately send transactions with new gas prices (skip waiting for next block)
+					groupStartIdx := s.currentWalletGroup * s.walletsPerGroup
+					groupEndIdx := groupStartIdx + s.walletsPerGroup
+					
+					s.logger.Infof("RETRYING transactions for wallet group %d of 10 (wallets %d-%d) with escalated prices",
+						s.currentWalletGroup, groupStartIdx, groupEndIdx-1)
+					
+					// Send batch with escalated prices
+					err = s.sendBatchTransactions(ctx, txIdxCounter, groupStartIdx, groupEndIdx)
+					if err != nil {
+						s.logger.Errorf("Failed to send retry batch after empty block: %v", err)
+					} else {
+						// Update counters for the retry batch
+						sentCount := groupEndIdx - groupStartIdx
+						txIdxCounter += sentCount
+						totalTxCount.Add(sentCount)
+					}
+				}
 
 				// Rotate to the next wallet group (0-9)
 				s.currentWalletGroup = (s.currentWalletGroup + 1) % 10
@@ -756,9 +820,28 @@ func (s *Scenario) sendTransaction(ctx context.Context, txIdx uint64) error {
 
 // updateDynamicFees queries the network and updates base fee and tip fee
 func (s *Scenario) updateDynamicFees(ctx context.Context) error {
+	return s.updateDynamicFeesWithEscalation(ctx, false)
+}
+
+// updateDynamicFeesWithEscalation updates fees with optional aggressive escalation
+func (s *Scenario) updateDynamicFeesWithEscalation(ctx context.Context, escalate bool) error {
 	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, s.options.ClientGroup)
 	if client == nil {
 		return fmt.Errorf("no client available")
+	}
+
+	if escalate {
+		// Aggressive escalation: add original fees to current fees
+		oldBaseFee := s.options.BaseFee
+		oldTipFee := s.options.TipFee
+		
+		s.options.BaseFee = s.options.BaseFee + s.originalBaseFee
+		s.options.TipFee = s.options.TipFee + s.originalTipFee
+
+		s.logger.Warnf("ESCALATING gas prices due to stuck transactions - Base fee: %d -> %d gwei (+%d), Tip fee: %d -> %d gwei (+%d)",
+			oldBaseFee, s.options.BaseFee, s.originalBaseFee,
+			oldTipFee, s.options.TipFee, s.originalTipFee)
+		return nil
 	}
 
 	ethClient := client.GetEthClient()
