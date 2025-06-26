@@ -18,22 +18,23 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/holiman/uint256"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethpandaops/spamoor/scenarios/statebloat/contract_deploy/contract"
 	"github.com/ethpandaops/spamoor/scenario"
+	"github.com/ethpandaops/spamoor/scenarios/statebloat/contract_deploy/contract"
 	"github.com/ethpandaops/spamoor/spamoor"
+	"github.com/ethpandaops/spamoor/txbuilder"
 )
 
 type ScenarioOptions struct {
-	MaxPending      uint64 `yaml:"max_pending"`
-	MaxWallets      uint64 `yaml:"max_wallets"`
-	BaseFee         uint64 `yaml:"base_fee"`
-	TipFee          uint64 `yaml:"tip_fee"`
-	ClientGroup     string `yaml:"client_group"`
-	MaxTransactions uint64 `yaml:"max_transactions"`
+	MaxWallets       uint64 `yaml:"max_wallets"`
+	BaseFee          uint64 `yaml:"base_fee"`
+	TipFee           uint64 `yaml:"tip_fee"`
+	ClientGroup      string `yaml:"client_group"`
+	MaxTransactions  uint64 `yaml:"max_transactions"`
 	RateLimitPercent uint64 `yaml:"rate_limit_percent"`
 }
 
@@ -84,15 +85,18 @@ type Scenario struct {
 	// Block monitoring for real-time logging
 	blockMonitorCancel context.CancelFunc
 	blockMonitorDone   chan struct{}
+
+	// Wallet group management for rate limiting
+	currentWalletGroup uint64
+	walletsPerGroup    uint64
 }
 
 var ScenarioName = "contract-deploy"
 var ScenarioDefaultOptions = ScenarioOptions{
-	MaxPending:      100, // Allow up to 100 pending transactions
-	MaxWallets:      0,   // Use root wallet only by default
-	BaseFee:         5,   // Moderate base fee (5 gwei)
-	TipFee:          1,   // Priority fee (1 gwei)
-	MaxTransactions: 0,
+	MaxWallets:       0, // Use root wallet only by default
+	BaseFee:          5, // Moderate base fee (5 gwei)
+	TipFee:           1, // Priority fee (1 gwei)
+	MaxTransactions:  0,
 	RateLimitPercent: 90, // Use 90% of block capacity by default
 }
 var ScenarioDescriptor = scenario.Descriptor{
@@ -110,7 +114,6 @@ func newScenario(logger logrus.FieldLogger) scenario.Scenario {
 }
 
 func (s *Scenario) Flags(flags *pflag.FlagSet) error {
-	flags.Uint64Var(&s.options.MaxPending, "max-pending", ScenarioDefaultOptions.MaxPending, "Maximum number of pending transactions")
 	flags.Uint64Var(&s.options.MaxWallets, "max-wallets", ScenarioDefaultOptions.MaxWallets, "Maximum number of child wallets to use")
 	flags.Uint64Var(&s.options.BaseFee, "basefee", ScenarioDefaultOptions.BaseFee, "Base fee per gas in gwei")
 	flags.Uint64Var(&s.options.TipFee, "tipfee", ScenarioDefaultOptions.TipFee, "Tip fee per gas in gwei")
@@ -130,17 +133,52 @@ func (s *Scenario) Init(options *scenario.Options) error {
 		}
 	}
 
-	if s.options.MaxWallets > 0 {
+	// For rate-limiting mode (MaxTransactions == 0), we need to calculate wallet count
+	// based on block capacity to implement the alternating wallet group strategy
+	if s.options.MaxTransactions == 0 && s.options.MaxWallets == 0 {
+		// Get a client to fetch block info
+		client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, s.options.ClientGroup)
+		if client == nil {
+			return fmt.Errorf("no client available for initialization")
+		}
+
+		// Get current block to calculate capacity
+		ctx := context.Background()
+		ethClient := client.GetEthClient()
+		currentBlock, err := ethClient.BlockByNumber(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to get current block: %w", err)
+		}
+
+		blockGasLimit := currentBlock.GasLimit()
+		estimatedGasPerContract := uint64(4949468)
+		maxContractsPerBlock := blockGasLimit / estimatedGasPerContract
+
+		// Apply rate limit percentage to avoid trying to fill blocks completely
+		rateLimitPercent := s.options.RateLimitPercent
+		if rateLimitPercent == 0 || rateLimitPercent > 100 {
+			rateLimitPercent = 90 // Default to 90% if not set
+		}
+		contractsPerGroup := (maxContractsPerBlock * rateLimitPercent) / 100
+
+		// Create 2x the number of wallets we need per group
+		// This allows us to alternate between two groups
+		totalWallets := contractsPerGroup * 2
+		s.walletsPerGroup = contractsPerGroup
+
+		s.logger.Infof("Rate limiting mode: creating %d wallets (%d per group for %d%% of %d max contracts/block)",
+			totalWallets, s.walletsPerGroup, rateLimitPercent, maxContractsPerBlock)
+
+		s.walletPool.SetWalletCount(totalWallets)
+	} else if s.options.MaxWallets > 0 {
 		s.walletPool.SetWalletCount(s.options.MaxWallets)
 	} else {
-		// Use only root wallet by default for better efficiency
-		// This avoids child wallet funding overhead
-		s.walletPool.SetWalletCount(0)
+		// Default to a reasonable number of wallets to avoid root wallet usage
+		s.walletPool.SetWalletCount(10)
 	}
 
 	return nil
 }
-
 
 // getChainID caches the chain ID to avoid repeated RPC calls
 func (s *Scenario) getChainID(ctx context.Context) (*big.Int, error) {
@@ -153,23 +191,6 @@ func (s *Scenario) getChainID(ctx context.Context) (*big.Int, error) {
 		s.chainID, s.chainIDError = client.GetChainId(ctx)
 	})
 	return s.chainID, s.chainIDError
-}
-
-// waitForPendingTxSlot waits until we have capacity for another transaction
-func (s *Scenario) waitForPendingTxSlot(ctx context.Context) {
-	for {
-		s.pendingTxsMutex.RLock()
-		count := len(s.pendingTxs)
-		s.pendingTxsMutex.RUnlock()
-
-		if count < int(s.options.MaxPending) {
-			return
-		}
-
-		// Check and clean up confirmed transactions
-		s.processPendingTransactions(ctx)
-		time.Sleep(1 * time.Second)
-	}
 }
 
 // processPendingTransactions checks for transaction confirmations and updates state
@@ -456,26 +477,11 @@ func (s *Scenario) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to get current block: %w", err)
 	}
 
-	// Calculate rate limiting based on block gas limit if max-transactions is 0
-	var expectedThroughput uint64
-	var useRateLimiting bool
-
-	if s.options.MaxTransactions == 0 {
-		blockGasLimit := currentBlock.GasLimit()
-		// TODO: This should be a constant.
-		estimatedGasPerContract := uint64(4949468) // Updated estimate based on contract size reduction
-		expectedThroughput = blockGasLimit / estimatedGasPerContract
-		useRateLimiting = true
-
-		s.logger.Infof("Rate limiting enabled: block gas limit %d, gas per contract %d, expected throughput %d contracts/block",
-			blockGasLimit, estimatedGasPerContract, expectedThroughput)
-	}
-
 	txIdxCounter := uint64(0)
 	totalTxCount := atomic.Uint64{}
-	blockTxCount := uint64(0)
 	lastBlockNumber := currentBlock.Number().Uint64()
 
+	// Main loop for alternating wallet groups
 	for {
 		// Check if we've reached max transactions (if set)
 		if s.options.MaxTransactions > 0 && txIdxCounter >= s.options.MaxTransactions {
@@ -483,61 +489,74 @@ func (s *Scenario) Run(ctx context.Context) error {
 			break
 		}
 
-		// Rate limiting logic
-		if useRateLimiting {
-			// Use configured percentage of expected throughput to avoid overflowing blocks
-			rateLimitPercent := s.options.RateLimitPercent
-			if rateLimitPercent == 0 || rateLimitPercent > 100 {
-				rateLimitPercent = 90 // Default to 90% if invalid
-			}
-			targetTxsPerBlock := expectedThroughput * rateLimitPercent / 100
-			if blockTxCount >= targetTxsPerBlock {
-				// Calculate block utilization percentage
-				blockUtilization := float64(blockTxCount) / float64(expectedThroughput) * 100
-				s.logger.Infof("Sent %d txs (target: %d [%d%%], max capacity: %d, block utilization: %.1f%%), waiting for next block", 
-					blockTxCount, targetTxsPerBlock, rateLimitPercent, expectedThroughput, blockUtilization)
-				
-				// Wait for block number to change
-				for {
-					currentBlock, err := ethClient.BlockByNumber(ctx, nil)
-					if err == nil && currentBlock.Number().Uint64() > lastBlockNumber {
-						lastBlockNumber = currentBlock.Number().Uint64()
-						blockTxCount = 0
-						break
-					}
-					time.Sleep(100 * time.Millisecond)
-				}
-			}
+		// Only proceed if we have wallet groups configured
+		if s.walletsPerGroup == 0 {
+			s.logger.Error("No wallet groups configured")
+			break
 		}
 
-		// Wait for available slot
-		s.waitForPendingTxSlot(ctx)
+		// Send batch of transactions for current wallet group
+		groupStartIdx := s.currentWalletGroup * s.walletsPerGroup
+		groupEndIdx := groupStartIdx + s.walletsPerGroup
 
-		// Send a single transaction
-		err := s.sendTransaction(ctx, txIdxCounter)
+		s.logger.Infof("Sending transactions for wallet group %d (wallets %d-%d)",
+			s.currentWalletGroup, groupStartIdx, groupEndIdx-1)
+
+		// Send all transactions for this group in parallel
+		err := s.sendBatchTransactions(ctx, txIdxCounter, groupStartIdx, groupEndIdx)
 		if err != nil {
-			s.logger.Warnf("failed to send transaction %d: %v", txIdxCounter, err)
-			time.Sleep(1 * time.Second)
-			continue
+			s.logger.Errorf("Failed to send batch transactions: %v", err)
+			break
 		}
 
-		txIdxCounter++
-		totalTxCount.Add(1)
-		blockTxCount++
+		// Update counters
+		sentCount := groupEndIdx - groupStartIdx
+		txIdxCounter += sentCount
+		totalTxCount.Add(sentCount)
 
-		// Process pending transactions periodically with 1 second intervals
-		if txIdxCounter%10 == 0 {
-			s.processPendingTransactions(ctx)
+		// Process pending transactions
+		s.processPendingTransactions(ctx)
 
-			s.contractsMutex.Lock()
-			contractCount := len(s.deployedContracts)
-			s.contractsMutex.Unlock()
+		// Wait for block number to change before switching groups
+		s.logger.Info("Waiting for next block...")
+		waitStartTime := time.Now()
+		for {
+			// Check if context is cancelled
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
 
-			s.logger.Infof("Progress: sent %d txs, deployed %d contracts", txIdxCounter, contractCount)
+			currentBlock, err := ethClient.BlockByNumber(ctx, nil)
+			if err != nil {
+				s.logger.Warnf("Failed to get current block: %v", err)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+
+			currentBlockNum := currentBlock.Number().Uint64()
+			if currentBlockNum > lastBlockNumber {
+				lastBlockNumber = currentBlockNum
+
+				// Toggle wallet group for the new block
+				s.currentWalletGroup = (s.currentWalletGroup + 1) % 2
+				s.logger.Infof("New block %d: switching to wallet group %d",
+					lastBlockNumber, s.currentWalletGroup)
+
+				break
+			}
+
+			// Log if we've been waiting too long
+			waitDuration := time.Since(waitStartTime)
+			if waitDuration > 30*time.Second {
+				s.logger.Warnf("Been waiting for new block for %v, current block: %d, waiting for block > %d",
+					waitDuration, currentBlockNum, lastBlockNumber)
+				waitStartTime = time.Now() // Reset to avoid log spam
+			}
+
+			time.Sleep(100 * time.Millisecond)
 		}
-
-		// Small delay to prevent overwhelming the RPC
-		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Wait for all pending transactions to complete with 1 second intervals
@@ -588,6 +607,50 @@ func (s *Scenario) Run(ctx context.Context) error {
 		"total_contracts": totalContracts,
 	}).Info("All transactions completed")
 
+	return nil
+}
+
+// sendBatchTransactions sends all transactions for a wallet group in parallel
+func (s *Scenario) sendBatchTransactions(ctx context.Context, baseIdx, startIdx, endIdx uint64) error {
+	var wg sync.WaitGroup
+	errors := make(chan error, endIdx-startIdx)
+
+	// Send one transaction per wallet in the group
+	for walletIdx := startIdx; walletIdx < endIdx; walletIdx++ {
+		wg.Add(1)
+		go func(idx uint64) {
+			defer wg.Done()
+
+			// Pass the wallet index directly as the transaction index
+			// This ensures each wallet is used exactly once
+			if err := s.sendTransaction(ctx, idx); err != nil {
+				errors <- fmt.Errorf("wallet %d: %w", idx, err)
+			}
+		}(walletIdx)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+	close(errors)
+
+	// Collect any errors
+	var errs []error
+	for err := range errors {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		s.logger.Warnf("Failed to send %d transactions out of %d", len(errs), endIdx-startIdx)
+		// Log first few errors for debugging
+		for i, err := range errs {
+			if i >= 5 {
+				break
+			}
+			s.logger.Warnf("Error %d: %v", i+1, err)
+		}
+	}
+
+	s.logger.Infof("Sent %d transactions from wallet group", endIdx-startIdx-uint64(len(errs)))
 	return nil
 }
 
@@ -661,71 +724,52 @@ func (s *Scenario) updateDynamicFees(ctx context.Context) error {
 
 // attemptTransaction makes a single attempt to send a transaction
 func (s *Scenario) attemptTransaction(ctx context.Context, txIdx uint64, attempt int) error {
-	// Get client and wallet
+	// Get client
 	client := s.walletPool.GetClient(spamoor.SelectClientRoundRobin, 0, "")
-	wallet := s.walletPool.GetRootWallet()
-
 	if client == nil {
 		return fmt.Errorf("no client available")
 	}
+
+	// txIdx is the wallet index in batch mode
+	wallet := s.walletPool.GetWallet(spamoor.SelectWalletByIndex, int(txIdx))
 	if wallet == nil {
-		return fmt.Errorf("no wallet available")
-	}
-
-	// Get cached chain ID
-	chainID, err := s.getChainID(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get chain ID: %w", err)
-	}
-
-	// Get current nonce for this wallet
-	addr := crypto.PubkeyToAddress(wallet.GetWallet().GetPrivateKey().PublicKey)
-	nonce, err := client.GetEthClient().PendingNonceAt(ctx, addr)
-	if err != nil {
-		return fmt.Errorf("failed to get nonce for %s: %w", addr.Hex(), err)
-	}
-
-	// Create transaction auth
-	auth, err := bind.NewKeyedTransactorWithChainID(wallet.GetWallet().GetPrivateKey(), chainID)
-	if err != nil {
-		return fmt.Errorf("failed to create auth: %w", err)
-	}
-
-	auth.Nonce = big.NewInt(int64(nonce))
-	auth.Value = big.NewInt(0)
-	auth.GasLimit = 5200000 // Fixed gas limit for contract deployment
-
-	// Set EIP-1559 fee parameters
-	if s.options.BaseFee > 0 {
-		auth.GasFeeCap = new(big.Int).Mul(big.NewInt(int64(s.options.BaseFee)), big.NewInt(1000000000))
-	}
-	if s.options.TipFee > 0 {
-		auth.GasTipCap = new(big.Int).Mul(big.NewInt(int64(s.options.TipFee)), big.NewInt(1000000000))
+		return fmt.Errorf("no wallet available at index %d", txIdx)
 	}
 
 	// Generate random salt for unique contract
 	salt := make([]byte, 32)
-	_, err = rand.Read(salt)
+	_, err := rand.Read(salt)
 	if err != nil {
 		return fmt.Errorf("failed to generate salt: %w", err)
 	}
 	saltInt := new(big.Int).SetBytes(salt)
 
-	// Deploy the contract
-	ethClient := client.GetEthClient()
-	if ethClient == nil {
-		return fmt.Errorf("failed to get eth client")
+	// Use BuildBoundTx which handles nonce management internally
+	tx, err := wallet.BuildBoundTx(ctx, &txbuilder.TxMetadata{
+		GasFeeCap: uint256.MustFromBig(new(big.Int).Mul(big.NewInt(int64(s.options.BaseFee)), big.NewInt(1000000000))),
+		GasTipCap: uint256.MustFromBig(new(big.Int).Mul(big.NewInt(int64(s.options.TipFee)), big.NewInt(1000000000))),
+		Gas:       5200000, // Fixed gas limit for contract deployment
+		Value:     uint256.NewInt(0),
+	}, func(transactOpts *bind.TransactOpts) (*types.Transaction, error) {
+		// Deploy the contract using the transactOpts provided by BuildBoundTx
+		_, deployTx, _, err := contract.DeployContract(transactOpts, client.GetEthClient(), saltInt)
+		return deployTx, err
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to build and deploy contract: %w", err)
 	}
 
-	_, tx, _, err := contract.DeployContract(auth, ethClient, saltInt)
+	// Send the transaction
+	err = client.SendTransaction(ctx, tx)
 	if err != nil {
-		return fmt.Errorf("failed to deploy contract: %w", err)
+		return fmt.Errorf("failed to send transaction: %w", err)
 	}
 
 	// Track pending transaction
 	pendingTx := &PendingTransaction{
 		TxHash:     tx.Hash(),
-		PrivateKey: wallet.GetWallet().GetPrivateKey(),
+		PrivateKey: wallet.GetPrivateKey(),
 		Timestamp:  time.Now(),
 	}
 
