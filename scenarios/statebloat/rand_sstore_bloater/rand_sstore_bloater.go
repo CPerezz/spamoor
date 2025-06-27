@@ -112,6 +112,12 @@ type Scenario struct {
 	// Metrics tracking
 	metricsStopChan chan struct{}
 	metricsDone     sync.WaitGroup
+
+	// Gas limit caching
+	cachedGasLimit     uint64
+	cachedGasLimitLock sync.RWMutex
+	gasLimitStopChan   chan struct{}
+	gasLimitDone       sync.WaitGroup
 }
 
 var ScenarioName = "rand_sstore_bloater"
@@ -134,6 +140,8 @@ func newScenario(logger logrus.FieldLogger) scenario.Scenario {
 		deploymentBuffer:             make([]BlockInfo, 0, 100),
 		deploymentStopChan:           make(chan struct{}),
 		metricsStopChan:              make(chan struct{}),
+		gasLimitStopChan:             make(chan struct{}),
+		cachedGasLimit:               30000000, // Default 30M gas limit
 	}
 }
 
@@ -330,33 +338,28 @@ func (s *Scenario) Run(ctx context.Context) error {
 	// Start background workers
 	s.startDeploymentTracker(ctx)
 	s.startMetricsLogger(ctx)
+	s.startGasLimitUpdater(ctx)
 
 	// Cleanup on exit
 	defer func() {
 		// Stop background workers
 		close(s.deploymentStopChan)
 		close(s.metricsStopChan)
+		close(s.gasLimitStopChan)
 		s.deploymentDone.Wait()
 		s.metricsDone.Wait()
+		s.gasLimitDone.Wait()
 
 		// Flush any remaining deployment data
 		s.flushDeploymentBuffer()
 	}()
 
-	// Calculate max pending transactions
-	maxPending := s.walletPool.GetConfiguredWalletCount() * 5
-	if maxPending < 20 {
-		maxPending = 20
-	}
-	if maxPending > 100 {
-		maxPending = 100
-	}
-
-	// Run transaction scenario
+	// Run transaction scenario with controlled throughput
+	// We want exactly 1 transaction per block to maximize gas usage
 	err := scenario.RunTransactionScenario(ctx, scenario.TransactionScenarioOptions{
 		TotalCount: 0, // Run indefinitely
-		Throughput: 0, // No rate limiting
-		MaxPending: maxPending,
+		Throughput: 1, // 1 transaction per slot (block)
+		MaxPending: 1, // Only 1 transaction at a time to ensure sequential execution
 		WalletPool: s.walletPool,
 		Logger:     s.logger,
 		ProcessNextTxFn: s.processNextTransaction,
@@ -626,4 +629,53 @@ func (s *Scenario) startMetricsLogger(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// startGasLimitUpdater starts a background goroutine to periodically update cached gas limit
+func (s *Scenario) startGasLimitUpdater(ctx context.Context) {
+	s.gasLimitDone.Add(1)
+	go func() {
+		defer s.gasLimitDone.Done()
+		
+		// Update immediately on start
+		s.updateGasLimit(ctx)
+		
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.gasLimitStopChan:
+				return
+			case <-ticker.C:
+				s.updateGasLimit(ctx)
+			}
+		}
+	}()
+}
+
+// updateGasLimit fetches the current block gas limit and updates the cache
+func (s *Scenario) updateGasLimit(ctx context.Context) {
+	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, "")
+	if client == nil {
+		s.logger.Warn("no client available for gas limit update")
+		return
+	}
+
+	latestBlock, err := client.GetEthClient().BlockByNumber(ctx, nil)
+	if err != nil {
+		s.logger.Warnf("failed to get latest block for gas limit: %v", err)
+		return
+	}
+
+	newGasLimit := latestBlock.GasLimit()
+	
+	s.cachedGasLimitLock.Lock()
+	if s.cachedGasLimit != newGasLimit {
+		s.logger.Infof("Updated cached gas limit from %d to %d", s.cachedGasLimit, newGasLimit)
+		s.cachedGasLimit = newGasLimit
+	}
+	s.cachedGasLimitLock.Unlock()
 }
