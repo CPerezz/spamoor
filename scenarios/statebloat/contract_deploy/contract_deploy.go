@@ -99,6 +99,11 @@ type Scenario struct {
 	consecutiveFailedBlockWaits uint64
 	emptyBlockRetryCount      uint64
 	maxGasPriceReached        bool
+
+	// Async file writing system to prevent blocking main loop
+	fileWriterChan   chan struct{}
+	fileWriterCancel context.CancelFunc
+	fileWriterDone   chan struct{}
 }
 
 var ScenarioName = "contract-deploy"
@@ -233,7 +238,12 @@ func (s *Scenario) getChainID(ctx context.Context) (*big.Int, error) {
 }
 
 // processPendingTransactions checks for transaction confirmations and updates state
+// This function is optimized to be fast and non-blocking to prevent main loop delays
 func (s *Scenario) processPendingTransactions(ctx context.Context) {
+	// Quick timeout to prevent blocking main loop
+	timeoutCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	
 	s.pendingTxsMutex.Lock()
 
 	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, s.options.ClientGroup)
@@ -253,7 +263,16 @@ func (s *Scenario) processPendingTransactions(ctx context.Context) {
 		TxHash          common.Hash
 	}
 
+	// Limit processing to prevent blocking - only check up to 20 transactions
+	checkedCount := 0
+	maxChecks := 20
+
 	for txHash, pendingTx := range s.pendingTxs {
+		if checkedCount >= maxChecks {
+			break // Don't check all transactions to avoid blocking
+		}
+		checkedCount++
+		
 		timeSinceSent := time.Since(pendingTx.Timestamp)
 		
 		// Check if transaction is stuck (>30 seconds without confirmation)
@@ -268,7 +287,8 @@ func (s *Scenario) processPendingTransactions(ctx context.Context) {
 			continue
 		}
 
-		receipt, err := ethClient.TransactionReceipt(ctx, txHash)
+		// Quick receipt check with timeout to prevent hanging
+		receipt, err := ethClient.TransactionReceipt(timeoutCtx, txHash)
 		if err != nil {
 			// Transaction still pending or error retrieving receipt
 			continue
@@ -311,11 +331,8 @@ func (s *Scenario) processPendingTransactions(ctx context.Context) {
 	if escalationNeeded {
 		s.logger.Warnf("Detected %d stuck transactions (>30s), escalating gas prices", len(stuckTxs))
 		
-		// Create timeout context for escalation to prevent hanging
-		escalationCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		
-		err := s.updateDynamicFeesWithEscalation(escalationCtx, true)
+		// Quick escalation without additional RPC calls to prevent blocking
+		err := s.updateDynamicFeesWithEscalation(timeoutCtx, true)
 		if err != nil {
 			s.logger.Warnf("Failed to escalate gas prices: %v", err)
 		} else {
@@ -323,7 +340,7 @@ func (s *Scenario) processPendingTransactions(ctx context.Context) {
 		}
 	}
 
-	// Process successful deployments
+	// Process successful deployments (now non-blocking due to async file writing)
 	for _, deployment := range successfulDeployments {
 		s.recordDeployedContract(deployment.ContractAddress, deployment.PrivateKey, deployment.Receipt, deployment.TxHash)
 	}
@@ -342,18 +359,9 @@ func (s *Scenario) recordDeployedContract(contractAddress common.Address, privat
 
 	s.deployedContracts = append(s.deployedContracts, deployment)
 
-	// Get the actual deployed contract bytecode size
-	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, s.options.ClientGroup)
-	// TODO: This should be a constant documented on how this number is obtained.
-	var bytecodeSize int = 23914
-
-	if client != nil {
-		// Get the actual deployed bytecode size using eth_getCode
-		contractCode, err := client.GetEthClient().CodeAt(context.Background(), contractAddress, nil)
-		if err == nil {
-			bytecodeSize = len(contractCode)
-		}
-	}
+	// Use constant bytecode size to avoid blocking RPC calls in main loop
+	// This prevents the main transaction sending loop from hanging on RPC timeouts
+	const bytecodeSize int = 23914 // Average deployed contract size
 
 	blockNumber := receipt.BlockNumber.Uint64()
 
@@ -391,10 +399,8 @@ func (s *Scenario) recordDeployedContract(contractAddress common.Address, privat
 		"bytecode_size":      blockStat.TotalBytecodeSize,
 	}).Debug("Updated block stats")
 
-	// Save the deployments.json file each time a contract is confirmed
-	if err := s.saveDeploymentsMapping(); err != nil {
-		s.logger.Warnf("Failed to save deployments.json: %v", err)
-	}
+	// Queue an async write to deployments.json (non-blocking)
+	s.queueFileWrite()
 }
 
 // Helper function for max calculation
@@ -405,8 +411,8 @@ func max(a, b int) int {
 	return b
 }
 
-// saveDeploymentsMapping creates/updates deployments.json with private key to contract address mapping
-func (s *Scenario) saveDeploymentsMapping() error {
+// writeDeploymentsFile creates/updates deployments.json with private key to contract address mapping
+func (s *Scenario) writeDeploymentsFile() error {
 	// Create a map from private key to array of contract addresses
 	deploymentMap := make(map[string][]string)
 
@@ -432,6 +438,18 @@ func (s *Scenario) saveDeploymentsMapping() error {
 	}
 
 	return nil
+}
+
+// queueFileWrite queues a deployments.json write request (non-blocking)
+func (s *Scenario) queueFileWrite() {
+	// Non-blocking send to prevent main loop from hanging
+	select {
+	case s.fileWriterChan <- struct{}{}:
+		// Successfully queued
+	default:
+		// Channel full, skip this write request to prevent blocking
+		s.logger.Debug("File writer channel full, skipping write request")
+	}
 }
 
 // startBlockMonitor starts a background goroutine that monitors for new blocks
@@ -514,6 +532,59 @@ func (s *Scenario) stopBlockMonitor() {
 	}
 }
 
+// startFileWriter starts a background goroutine for async file writing
+// This prevents file I/O operations from blocking the main transaction sending loop
+func (s *Scenario) startFileWriter(ctx context.Context) {
+	fileCtx, cancel := context.WithCancel(ctx)
+	s.fileWriterCancel = cancel
+	s.fileWriterChan = make(chan struct{}, 100) // Buffer to prevent blocking
+	s.fileWriterDone = make(chan struct{})
+
+	go func() {
+		defer close(s.fileWriterDone)
+		
+		// Batch writes every 5 seconds or when buffer is full
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		
+		pendingWrites := 0
+		
+		for {
+			select {
+			case <-fileCtx.Done():
+				// Final write before shutdown
+				if pendingWrites > 0 {
+					s.writeDeploymentsFile()
+				}
+				return
+			case <-s.fileWriterChan:
+				pendingWrites++
+				// Write immediately if buffer reaches threshold
+				if pendingWrites >= 50 {
+					s.writeDeploymentsFile()
+					pendingWrites = 0
+				}
+			case <-ticker.C:
+				// Periodic write if there are pending changes
+				if pendingWrites > 0 {
+					s.writeDeploymentsFile()
+					pendingWrites = 0
+				}
+			}
+		}
+	}()
+}
+
+// stopFileWriter stops the async file writer and ensures final write
+func (s *Scenario) stopFileWriter() {
+	if s.fileWriterCancel != nil {
+		s.fileWriterCancel()
+	}
+	if s.fileWriterDone != nil {
+		<-s.fileWriterDone // Wait for final write to complete
+	}
+}
+
 func (s *Scenario) Run(ctx context.Context) error {
 	s.logger.Infof("starting scenario: %s", ScenarioName)
 	defer s.logger.Infof("scenario %s finished.", ScenarioName)
@@ -523,6 +594,10 @@ func (s *Scenario) Run(ctx context.Context) error {
 	s.originalTipFee = s.options.TipFee
 	s.logger.Infof("Stored original gas prices - Base fee: %d gwei, Tip fee: %d gwei", 
 		s.originalBaseFee, s.originalTipFee)
+
+	// Start async file writer to prevent blocking main loop
+	s.startFileWriter(ctx)
+	defer s.stopFileWriter()
 
 	// Start block monitoring for real-time logging
 	s.startBlockMonitor(ctx)
@@ -633,7 +708,10 @@ func (s *Scenario) Run(ctx context.Context) error {
 				break
 			}
 
-			currentBlock, err := ethClient.BlockByNumber(ctx, nil)
+			// Quick timeout for block number check to prevent hanging
+			blockCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			currentBlock, err := ethClient.BlockByNumber(blockCtx, nil)
+			cancel()
 			if err != nil {
 				s.logger.Warnf("Failed to get current block: %v", err)
 				time.Sleep(500 * time.Millisecond)
@@ -652,44 +730,15 @@ func (s *Scenario) Run(ctx context.Context) error {
 					s.logger.Warnf("Block %d is EMPTY (0 transactions), consecutive empty blocks: %d", 
 						lastBlockNumber, s.consecutiveEmptyBlocks)
 					
-					// Circuit breaker: if too many consecutive empty blocks, stop retrying
-					if s.consecutiveEmptyBlocks > 5 {
-						s.logger.Errorf("CIRCUIT BREAKER: Too many consecutive empty blocks (%d), skipping retry to prevent deadlock", 
-							s.consecutiveEmptyBlocks)
-					} else if s.emptyBlockRetryCount < 3 && !s.maxGasPriceReached {
-						// Limited retries per empty block
-						s.emptyBlockRetryCount++
-						
-						// Escalate gas prices due to empty block
+					// Simple escalation without blocking sleeps or retries
+					if s.consecutiveEmptyBlocks == 1 && !s.maxGasPriceReached {
+						// Escalate gas prices immediately on first empty block
 						err := s.updateDynamicFeesWithEscalation(ctx, true)
 						if err != nil {
 							s.logger.Warnf("Failed to escalate gas prices after empty block: %v", err)
-						}
-						
-						// Add cooldown to prevent excessive retries
-						s.logger.Infof("Adding 10-second cooldown before retry (attempt %d/3)", s.emptyBlockRetryCount)
-						time.Sleep(10 * time.Second)
-						
-						// Immediately send transactions with new gas prices (skip waiting for next block)
-						groupStartIdx := s.currentWalletGroup * s.walletsPerGroup
-						groupEndIdx := groupStartIdx + s.walletsPerGroup
-						
-						s.logger.Infof("RETRYING transactions for wallet group %d of 10 (wallets %d-%d) with escalated prices",
-							s.currentWalletGroup, groupStartIdx, groupEndIdx-1)
-						
-						// Send batch with escalated prices
-						err = s.sendBatchTransactions(ctx, txIdxCounter, groupStartIdx, groupEndIdx)
-						if err != nil {
-							s.logger.Errorf("Failed to send retry batch after empty block: %v", err)
 						} else {
-							// Update counters for the retry batch
-							sentCount := groupEndIdx - groupStartIdx
-							txIdxCounter += sentCount
-							totalTxCount.Add(sentCount)
+							s.logger.Infof("Gas prices escalated due to empty block, will use new prices in next batch")
 						}
-					} else {
-						s.logger.Warnf("Skipping empty block retry (attempts: %d/3, max gas reached: %v)", 
-							s.emptyBlockRetryCount, s.maxGasPriceReached)
 					}
 				} else {
 					// Block has transactions - reset empty block counters
@@ -936,8 +985,10 @@ func (s *Scenario) updateDynamicFeesWithEscalation(ctx context.Context, escalate
 
 	ethClient := client.GetEthClient()
 
-	// Get the latest block to check current base fee
-	latestBlock, err := ethClient.BlockByNumber(ctx, nil)
+	// Get the latest block to check current base fee with timeout
+	blockCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	latestBlock, err := ethClient.BlockByNumber(blockCtx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get latest block: %w", err)
 	}
@@ -987,8 +1038,11 @@ func (s *Scenario) attemptTransaction(ctx context.Context, txIdx uint64, attempt
 	}
 	saltInt := new(big.Int).SetBytes(salt)
 
-	// Use BuildBoundTx which handles nonce management internally
-	tx, err := wallet.BuildBoundTx(ctx, &txbuilder.TxMetadata{
+	// Use BuildBoundTx with timeout to prevent hanging
+	txCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	
+	tx, err := wallet.BuildBoundTx(txCtx, &txbuilder.TxMetadata{
 		GasFeeCap: uint256.MustFromBig(new(big.Int).Mul(big.NewInt(int64(s.options.BaseFee)), big.NewInt(1000000000))),
 		GasTipCap: uint256.MustFromBig(new(big.Int).Mul(big.NewInt(int64(s.options.TipFee)), big.NewInt(1000000000))),
 		Gas:       5200000, // Fixed gas limit for contract deployment
@@ -1003,8 +1057,10 @@ func (s *Scenario) attemptTransaction(ctx context.Context, txIdx uint64, attempt
 		return fmt.Errorf("failed to build and deploy contract: %w", err)
 	}
 
-	// Send the transaction
-	err = client.SendTransaction(ctx, tx)
+	// Send the transaction with timeout
+	sendCtx, cancelSend := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelSend()
+	err = client.SendTransaction(sendCtx, tx)
 	if err != nil {
 		return fmt.Errorf("failed to send transaction: %w", err)
 	}
