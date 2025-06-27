@@ -98,8 +98,8 @@ func GetDefaultWalletConfig(scenarioName string) *WalletPoolConfig {
 	return &WalletPoolConfig{
 		WalletSeed:     fmt.Sprintf("%v-%v", scenarioName, rand.Intn(1000000)),
 		WalletCount:    0,
-		RefillAmount:   uint256.NewInt(5000000000000000000),
-		RefillBalance:  uint256.NewInt(1000000000000000000),
+		RefillAmount:   new(uint256.Int).Mul(uint256.NewInt(1000), uint256.NewInt(1000000000000000000)), // 1000 ETH
+		RefillBalance:  new(uint256.Int).Mul(uint256.NewInt(100), uint256.NewInt(1000000000000000000)),   // 100 ETH
 		RefillInterval: 600,
 	}
 }

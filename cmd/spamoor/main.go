@@ -39,8 +39,8 @@ func main() {
 	flags.StringVar(&cliArgs.rpchostsFile, "rpchost-file", "", "File with a list of RPC hosts to send transactions to.")
 	flags.StringVarP(&cliArgs.privkey, "privkey", "p", "", "The private key of the wallet to send funds from.")
 	flags.StringVarP(&cliArgs.seed, "seed", "s", "", "The child wallet seed.")
-	flags.Uint64Var(&cliArgs.refillAmount, "refill-amount", 5, "Amount of ETH to fund/refill each child wallet with.")
-	flags.Uint64Var(&cliArgs.refillBalance, "refill-balance", 2, "Min amount of ETH each child wallet should hold before refilling.")
+	flags.Uint64Var(&cliArgs.refillAmount, "refill-amount", 1000, "Amount of ETH to fund/refill each child wallet with.")
+	flags.Uint64Var(&cliArgs.refillBalance, "refill-balance", 100, "Min amount of ETH each child wallet should hold before refilling.")
 	flags.Uint64Var(&cliArgs.refillInterval, "refill-interval", 300, "Interval for child wallet rbalance check and refilling if needed (in sec).")
 
 	flags.Parse(os.Args)
