@@ -49,6 +49,7 @@ type PendingTransaction struct {
 	TxHash     common.Hash
 	PrivateKey *ecdsa.PrivateKey
 	Timestamp  time.Time
+	Sent       bool // Track if transaction was successfully sent
 }
 
 // BlockDeploymentStats tracks deployment statistics per block
@@ -95,10 +96,10 @@ type Scenario struct {
 	originalTipFee  uint64
 
 	// Deadlock prevention counters
-	consecutiveEmptyBlocks    uint64
+	consecutiveEmptyBlocks      uint64
 	consecutiveFailedBlockWaits uint64
-	emptyBlockRetryCount      uint64
-	maxGasPriceReached        bool
+	emptyBlockRetryCount        uint64
+	maxGasPriceReached          bool
 
 	// Async file writing system to prevent blocking main loop
 	fileWriterChan   chan struct{}
@@ -109,9 +110,9 @@ type Scenario struct {
 	sentTxChan      chan *PendingTransaction // Sender -> Monitor: new transactions
 	newBlockChan    chan uint64              // Monitor -> Sender: new block signal
 	gasEscalateChan chan bool                // Monitor -> Sender: escalate gas prices
-	
+
 	// Stuck transaction replacement channels
-	requestStuckTxChan  chan bool                            // Sender -> Monitor: request stuck txs
+	requestStuckTxChan  chan bool                                // Sender -> Monitor: request stuck txs
 	responseStuckTxChan chan map[common.Hash]*PendingTransaction // Monitor -> Sender: stuck tx list
 }
 
@@ -252,7 +253,7 @@ func (s *Scenario) processPendingTransactionsOLD(ctx context.Context) {
 	// Quick timeout to prevent blocking main loop
 	timeoutCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	
+
 	s.pendingTxsMutex.Lock()
 
 	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, s.options.ClientGroup)
@@ -281,14 +282,14 @@ func (s *Scenario) processPendingTransactionsOLD(ctx context.Context) {
 			break // Don't check all transactions to avoid blocking
 		}
 		checkedCount++
-		
+
 		timeSinceSent := time.Since(pendingTx.Timestamp)
-		
+
 		// Check if transaction is stuck (>30 seconds without confirmation)
 		if timeSinceSent > 30*time.Second && timeSinceSent <= 1*time.Minute {
 			stuckTxs = append(stuckTxs, txHash)
 		}
-		
+
 		// Check if transaction is too old (1 minute timeout)
 		if timeSinceSent > 1*time.Minute {
 			s.logger.Warnf("Transaction %s timed out after 1 minute, removing from pending", txHash.Hex())
@@ -323,7 +324,7 @@ func (s *Scenario) processPendingTransactionsOLD(ctx context.Context) {
 
 	// Trigger gas price escalation if we have stuck transactions
 	escalationNeeded := len(stuckTxs) > 0
-	
+
 	// Remove confirmed transactions from pending map
 	for _, txHash := range confirmedTxs {
 		delete(s.pendingTxs, txHash)
@@ -339,7 +340,7 @@ func (s *Scenario) processPendingTransactionsOLD(ctx context.Context) {
 	// Handle gas price escalation outside of mutex lock to prevent deadlock
 	if escalationNeeded {
 		s.logger.Warnf("Detected %d stuck transactions (>30s), escalating gas prices", len(stuckTxs))
-		
+
 		// Quick escalation without additional RPC calls to prevent blocking
 		err := s.updateDynamicFeesWithEscalation(timeoutCtx, true)
 		if err != nil {
@@ -551,13 +552,13 @@ func (s *Scenario) startFileWriter(ctx context.Context) {
 
 	go func() {
 		defer close(s.fileWriterDone)
-		
+
 		// Batch writes every 5 seconds or when buffer is full
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
-		
+
 		pendingWrites := 0
-		
+
 		for {
 			select {
 			case <-fileCtx.Done():
@@ -601,17 +602,17 @@ func (s *Scenario) Run(ctx context.Context) error {
 	// Store original gas prices for escalation
 	s.originalBaseFee = s.options.BaseFee
 	s.originalTipFee = s.options.TipFee
-	s.logger.Infof("Stored original gas prices - Base fee: %d gwei, Tip fee: %d gwei", 
+	s.logger.Infof("Stored original gas prices - Base fee: %d gwei, Tip fee: %d gwei",
 		s.originalBaseFee, s.originalTipFee)
 
 	// Initialize channels for goroutine communication
-	s.sentTxChan = make(chan *PendingTransaction, 1000)      // Buffer for sent transactions
-	s.newBlockChan = make(chan uint64, 10)                   // Buffer for block numbers
-	s.gasEscalateChan = make(chan bool, 10)                  // Buffer for gas escalation signals
-	
+	s.sentTxChan = make(chan *PendingTransaction, 1000) // Buffer for sent transactions
+	s.newBlockChan = make(chan uint64, 10)              // Buffer for block numbers
+	s.gasEscalateChan = make(chan bool, 10)             // Buffer for gas escalation signals
+
 	// Initialize stuck transaction replacement channels
-	s.requestStuckTxChan = make(chan bool, 1)                                    // Request channel
-	s.responseStuckTxChan = make(chan map[common.Hash]*PendingTransaction, 1)   // Response channel
+	s.requestStuckTxChan = make(chan bool, 1)                                 // Request channel
+	s.responseStuckTxChan = make(chan map[common.Hash]*PendingTransaction, 1) // Response channel
 
 	// Start async file writer to prevent blocking main loop
 	s.startFileWriter(ctx)
@@ -626,7 +627,7 @@ func (s *Scenario) Run(ctx context.Context) error {
 
 	// Create error channel for goroutines
 	errChan := make(chan error, 2)
-	
+
 	// Create a shared context for both goroutines
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
@@ -668,23 +669,23 @@ func (s *Scenario) Run(ctx context.Context) error {
 // This goroutine ONLY sends transactions and never blocks on processing
 func (s *Scenario) runTransactionSender(ctx context.Context) error {
 	s.logger.Info("Starting transaction sender goroutine")
-	
+
 	// Get initial block number
 	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, s.options.ClientGroup)
 	if client == nil {
 		return fmt.Errorf("no client available")
 	}
-	
+
 	ethClient := client.GetEthClient()
 	currentBlock, err := ethClient.BlockByNumber(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get initial block: %w", err)
 	}
-	
+
 	lastBlockNumber := currentBlock.Number().Uint64()
 	txIdxCounter := uint64(0)
 	totalTxCount := atomic.Uint64{}
-	
+
 	// Main sending loop
 	for {
 		select {
@@ -701,40 +702,40 @@ func (s *Scenario) runTransactionSender(ctx context.Context) error {
 		default:
 			// Continue with normal flow
 		}
-		
+
 		// Check if we've reached max transactions (if set)
 		if s.options.MaxTransactions > 0 && txIdxCounter >= s.options.MaxTransactions {
 			s.logger.Infof("Reached maximum number of transactions (%d)", s.options.MaxTransactions)
 			close(s.sentTxChan) // Signal monitor to stop
 			return nil
 		}
-		
+
 		// Check wallet groups configured
 		if s.walletsPerGroup == 0 {
 			return fmt.Errorf("no wallet groups configured")
 		}
-		
+
 		// Send batch of transactions for current wallet group
 		groupStartIdx := s.currentWalletGroup * s.walletsPerGroup
 		groupEndIdx := groupStartIdx + s.walletsPerGroup
-		
+
 		s.logger.Infof("Sending transactions for wallet group %d of 10 (wallets %d-%d)",
 			s.currentWalletGroup, groupStartIdx, groupEndIdx-1)
-		
+
 		// Send all transactions for this group
 		err := s.sendBatchTransactionsWithTracking(ctx, txIdxCounter, groupStartIdx, groupEndIdx)
 		if err != nil {
 			return fmt.Errorf("failed to send batch: %w", err)
 		}
-		
+
 		// Update counters
 		sentCount := groupEndIdx - groupStartIdx
 		txIdxCounter += sentCount
 		totalTxCount.Add(sentCount)
-		
+
 		// Wait for new block signal from monitor
 		s.logger.Info("Waiting for next block...")
-		
+
 		waitTimeout := time.NewTimer(2 * time.Minute)
 		select {
 		case <-ctx.Done():
@@ -743,24 +744,24 @@ func (s *Scenario) runTransactionSender(ctx context.Context) error {
 		case newBlockNum := <-s.newBlockChan:
 			waitTimeout.Stop()
 			lastBlockNumber = newBlockNum
-			s.logger.Infof("New block %d: switching to wallet group %d", 
-				lastBlockNumber, (s.currentWalletGroup + 1) % 10)
+			s.logger.Infof("New block %d: switching to wallet group %d",
+				lastBlockNumber, (s.currentWalletGroup+1)%10)
 			// Rotate to next wallet group
 			previousGroup := s.currentWalletGroup
 			s.currentWalletGroup = (s.currentWalletGroup + 1) % 10
-			
+
 			// Check if we completed a full round (went from group 9 back to 0)
 			if previousGroup == 9 && s.currentWalletGroup == 0 {
 				s.logger.Info("Completed full wallet group cycle, checking for stuck transactions")
 				s.handleStuckTransactions(ctx)
 			}
-			
+
 		case <-waitTimeout.C:
 			// Timeout waiting for block, force progression
 			s.logger.Warn("Timeout waiting for new block, forcing progression")
 			previousGroup := s.currentWalletGroup
 			s.currentWalletGroup = (s.currentWalletGroup + 1) % 10
-			
+
 			// Check if we completed a full round
 			if previousGroup == 9 && s.currentWalletGroup == 0 {
 				s.logger.Info("Completed full wallet group cycle, checking for stuck transactions")
@@ -780,7 +781,7 @@ func (s *Scenario) handleStuckTransactions(ctx context.Context) {
 		s.logger.Warn("Timeout sending stuck tx request, monitor might be busy")
 		return
 	}
-	
+
 	// Wait for response with stuck transactions
 	var stuckTxs map[common.Hash]*PendingTransaction
 	select {
@@ -790,12 +791,12 @@ func (s *Scenario) handleStuckTransactions(ctx context.Context) {
 		s.logger.Warn("Timeout waiting for stuck transactions response")
 		return
 	}
-	
+
 	if len(stuckTxs) == 0 {
 		s.logger.Debug("No stuck transactions found")
 		return
 	}
-	
+
 	// Send replacement transactions
 	s.sendReplacementTransactions(ctx, stuckTxs)
 }
@@ -803,7 +804,7 @@ func (s *Scenario) handleStuckTransactions(ctx context.Context) {
 // sendReplacementTransactions sends replacement transactions for stuck ones
 func (s *Scenario) sendReplacementTransactions(ctx context.Context, stuckTxs map[common.Hash]*PendingTransaction) {
 	s.logger.Infof("Sending replacement transactions for %d stuck transactions", len(stuckTxs))
-	
+
 	// Get client for querying transaction details
 	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, s.options.ClientGroup)
 	if client == nil {
@@ -811,24 +812,31 @@ func (s *Scenario) sendReplacementTransactions(ctx context.Context, stuckTxs map
 		return
 	}
 	ethClient := client.GetEthClient()
-	
+
 	replacedCount := 0
 	failedCount := 0
-	
+
 	// Process each stuck transaction
 	for txHash, pendingTx := range stuckTxs {
+		// Skip transactions that were not actually sent successfully
+		if !pendingTx.Sent {
+			s.logger.Debugf("Skipping transaction %s - was not successfully sent", txHash.Hex())
+			continue
+		}
+
 		// Get the actual transaction to find its nonce
 		tx, _, err := ethClient.TransactionByHash(ctx, txHash)
 		if err != nil {
-			s.logger.Warnf("Failed to get transaction %s: %v", txHash.Hex(), err)
+			// Transaction not found - it was never actually sent or already dropped from mempool
+			s.logger.Debugf("Transaction %s not found in mempool (may have been dropped): %v", txHash.Hex(), err)
 			failedCount++
 			continue
 		}
-		
+
 		// Find the wallet
 		walletAddr := crypto.PubkeyToAddress(pendingTx.PrivateKey.PublicKey)
 		var wallet *spamoor.Wallet
-		
+
 		// Search for the wallet in our pool
 		for i := uint64(0); i < s.walletPool.GetWalletCount(); i++ {
 			w := s.walletPool.GetWallet(spamoor.SelectWalletByIndex, int(i))
@@ -837,16 +845,16 @@ func (s *Scenario) sendReplacementTransactions(ctx context.Context, stuckTxs map
 				break
 			}
 		}
-		
+
 		if wallet == nil {
 			s.logger.Errorf("Could not find wallet for address %s", walletAddr.Hex())
 			failedCount++
 			continue
 		}
-		
+
 		// Use the transaction's actual nonce for replacement
 		txNonce := tx.Nonce()
-		
+
 		// Build and send replacement transaction
 		if err := s.sendSingleReplacement(ctx, wallet, txNonce); err != nil {
 			s.logger.Warnf("Failed to send replacement for %s (nonce %d): %v", txHash.Hex(), txNonce, err)
@@ -856,7 +864,7 @@ func (s *Scenario) sendReplacementTransactions(ctx context.Context, stuckTxs map
 			replacedCount++
 		}
 	}
-	
+
 	s.logger.Infof("Replacement complete: %d succeeded, %d failed", replacedCount, failedCount)
 }
 
@@ -867,7 +875,7 @@ func (s *Scenario) sendSingleReplacement(ctx context.Context, wallet *spamoor.Wa
 	if client == nil {
 		return fmt.Errorf("no client available")
 	}
-	
+
 	// Generate random salt for unique contract
 	salt := make([]byte, 32)
 	_, err := rand.Read(salt)
@@ -875,25 +883,25 @@ func (s *Scenario) sendSingleReplacement(ctx context.Context, wallet *spamoor.Wa
 		return fmt.Errorf("failed to generate salt: %w", err)
 	}
 	saltInt := new(big.Int).SetBytes(salt)
-	
+
 	// Calculate replacement gas prices (20% higher)
 	replacementBaseFee := s.options.BaseFee + (s.options.BaseFee * 20 / 100)
 	replacementTipFee := s.options.TipFee + (s.options.TipFee * 20 / 100)
-	
+
 	s.logger.Debugf("Replacement gas prices - Base: %d gwei (was %d), Tip: %d gwei (was %d)",
 		replacementBaseFee, s.options.BaseFee, replacementTipFee, s.options.TipFee)
-	
+
 	// Build replacement transaction with specific nonce
 	txCtx, cancel := context.WithTimeout(ctx, 10*time.Second) // Longer timeout for replacements
 	defer cancel()
-	
+
 	// We need to use ReplaceTransaction method or build manually with specific nonce
 	// Since BuildBoundTx auto-increments nonce, we'll use a manual approach
 	transactor, err := bind.NewKeyedTransactorWithChainID(wallet.GetPrivateKey(), s.chainID)
 	if err != nil {
 		return fmt.Errorf("failed to create transactor: %w", err)
 	}
-	
+
 	transactor.Context = txCtx
 	transactor.From = wallet.GetAddress()
 	transactor.Nonce = big.NewInt(int64(nonce))
@@ -902,13 +910,13 @@ func (s *Scenario) sendSingleReplacement(ctx context.Context, wallet *spamoor.Wa
 	transactor.GasLimit = 5200000
 	transactor.Value = big.NewInt(0)
 	transactor.NoSend = true
-	
+
 	// Deploy the contract
 	_, tx, _, err := contract.DeployContract(transactor, client.GetEthClient(), saltInt)
 	if err != nil {
 		return fmt.Errorf("failed to build replacement contract deployment: %w", err)
 	}
-	
+
 	// Send the replacement transaction
 	sendCtx, cancelSend := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelSend()
@@ -916,7 +924,7 @@ func (s *Scenario) sendSingleReplacement(ctx context.Context, wallet *spamoor.Wa
 	if err != nil {
 		return fmt.Errorf("failed to send replacement transaction: %w", err)
 	}
-	
+
 	// Track the replacement transaction
 	select {
 	case s.sentTxChan <- &PendingTransaction{
@@ -928,7 +936,7 @@ func (s *Scenario) sendSingleReplacement(ctx context.Context, wallet *spamoor.Wa
 	default:
 		// Channel full, but not critical for replacements
 	}
-	
+
 	return nil
 }
 
@@ -936,43 +944,51 @@ func (s *Scenario) sendSingleReplacement(ctx context.Context, wallet *spamoor.Wa
 func (s *Scenario) sendBatchTransactionsWithTracking(ctx context.Context, baseIdx, startIdx, endIdx uint64) error {
 	var wg sync.WaitGroup
 	errors := make(chan error, endIdx-startIdx)
-	
+	successfulTxs := make(chan *PendingTransaction, endIdx-startIdx)
+
 	// Send one transaction per wallet in the group
 	for walletIdx := startIdx; walletIdx < endIdx; walletIdx++ {
 		wg.Add(1)
 		go func(idx uint64) {
 			defer wg.Done()
-			
+
 			// Send transaction and track it
 			if tx, privKey, err := s.sendAndTrackTransaction(ctx, idx); err != nil {
 				errors <- fmt.Errorf("wallet %d: %w", idx, err)
 			} else if tx != nil {
-				// Send to monitor via channel (non-blocking)
-				select {
-				case s.sentTxChan <- &PendingTransaction{
+				// Only track successfully sent transactions
+				successfulTxs <- &PendingTransaction{
 					TxHash:     tx.Hash(),
 					PrivateKey: privKey,
 					Timestamp:  time.Now(),
-				}:
-					// Successfully sent to monitor
-				default:
-					// Channel full, log but don't block
-					s.logger.Warnf("sentTxChan full, dropping tx %s", tx.Hash().Hex())
+					Sent:       true,
 				}
 			}
 		}(walletIdx)
 	}
-	
+
 	// Wait for all goroutines to complete
 	wg.Wait()
 	close(errors)
-	
+	close(successfulTxs)
+
+	// Send successful transactions to monitor (non-blocking)
+	for pendingTx := range successfulTxs {
+		select {
+		case s.sentTxChan <- pendingTx:
+			// Successfully sent to monitor
+		default:
+			// Channel full, log but don't block
+			s.logger.Warnf("sentTxChan full, dropping tx %s", pendingTx.TxHash.Hex())
+		}
+	}
+
 	// Collect any errors
 	var errs []error
 	for err := range errors {
 		errs = append(errs, err)
 	}
-	
+
 	if len(errs) > 0 {
 		s.logger.Warnf("Failed to send %d transactions out of %d", len(errs), endIdx-startIdx)
 		// Log first few errors for debugging
@@ -983,7 +999,7 @@ func (s *Scenario) sendBatchTransactionsWithTracking(ctx context.Context, baseId
 			s.logger.Warnf("Error %d: %v", i+1, err)
 		}
 	}
-	
+
 	s.logger.Infof("Sent %d transactions from wallet group", endIdx-startIdx-uint64(len(errs)))
 	return nil
 }
@@ -1036,57 +1052,57 @@ func (s *Scenario) sendBatchTransactions(ctx context.Context, baseIdx, startIdx,
 // This goroutine handles all heavy processing to keep the sender free
 func (s *Scenario) runBlockMonitor(ctx context.Context) error {
 	s.logger.Info("Starting block monitor goroutine")
-	
+
 	// Get client for monitoring
 	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, s.options.ClientGroup)
 	if client == nil {
 		return fmt.Errorf("no client available for monitoring")
 	}
 	ethClient := client.GetEthClient()
-	
+
 	// Get initial block number
 	currentBlock, err := ethClient.BlockByNumber(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get initial block: %w", err)
 	}
-	
+
 	lastBlockNumber := currentBlock.Number().Uint64()
 	consecutiveEmptyBlocks := uint64(0)
-	
+
 	// Initialize pending transactions map
 	pendingTxs := make(map[common.Hash]*PendingTransaction)
-	
+
 	// Block monitoring ticker
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	
+
 	// Track total contracts for final summary
 	totalContracts := 0
-	
+
 	for {
 		select {
 		case <-ctx.Done():
 			s.logger.Info("Block monitor stopping due to context cancellation")
-			
+
 			// Final summary
 			s.logger.WithFields(logrus.Fields{
 				"total_contracts": totalContracts,
 			}).Info("Block monitor final summary")
-			
+
 			return nil
-			
+
 		case pendingTx := <-s.sentTxChan:
 			// New transaction sent by sender
 			if pendingTx != nil {
 				pendingTxs[pendingTx.TxHash] = pendingTx
 				s.logger.Debugf("Tracking new transaction %s", pendingTx.TxHash.Hex())
 			}
-			
+
 		case <-s.requestStuckTxChan:
 			// Sender requested list of stuck transactions
 			s.logger.Debug("Received request for stuck transactions")
 			stuckTxs := s.getStuckTransactions(pendingTxs, 30*time.Second)
-			
+
 			// Send response
 			select {
 			case s.responseStuckTxChan <- stuckTxs:
@@ -1094,20 +1110,20 @@ func (s *Scenario) runBlockMonitor(ctx context.Context) error {
 			case <-time.After(1 * time.Second):
 				s.logger.Warn("Timeout sending stuck transactions response")
 			}
-			
+
 		case <-ticker.C:
 			// Check for new block
 			blockCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			latestBlock, err := ethClient.BlockByNumber(blockCtx, nil)
 			cancel()
-			
+
 			if err != nil {
 				s.logger.Warnf("Failed to get latest block: %v", err)
 				continue
 			}
-			
+
 			currentBlockNum := latestBlock.Number().Uint64()
-			
+
 			// Process new blocks
 			if currentBlockNum > lastBlockNumber {
 				// Process all blocks from last to current
@@ -1116,19 +1132,19 @@ func (s *Scenario) runBlockMonitor(ctx context.Context) error {
 					blockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 					block, err := ethClient.BlockByNumber(blockCtx, big.NewInt(int64(blockNum)))
 					cancel()
-					
+
 					if err != nil {
 						s.logger.Warnf("Failed to get block %d: %v", blockNum, err)
 						continue
 					}
-					
+
 					// Check if block is empty
 					txCount := len(block.Transactions())
 					if txCount == 0 {
 						consecutiveEmptyBlocks++
-						s.logger.Warnf("Block %d is EMPTY (0 transactions), consecutive: %d", 
+						s.logger.Warnf("Block %d is EMPTY (0 transactions), consecutive: %d",
 							blockNum, consecutiveEmptyBlocks)
-						
+
 						// Send gas escalation signal on first empty block
 						if consecutiveEmptyBlocks == 1 {
 							select {
@@ -1141,21 +1157,21 @@ func (s *Scenario) runBlockMonitor(ctx context.Context) error {
 					} else {
 						consecutiveEmptyBlocks = 0
 					}
-					
+
 					// Process transactions in this block
 					confirmedCount := s.processBlockTransactions(ctx, block, pendingTxs)
 					if confirmedCount > 0 {
 						totalContracts += confirmedCount
-						s.logger.Infof("Block %d: confirmed %d contracts (total: %d)", 
+						s.logger.Infof("Block %d: confirmed %d contracts (total: %d)",
 							blockNum, confirmedCount, totalContracts)
 					}
-					
+
 					// Clean up old pending transactions (timeout after 2 minutes)
 					s.cleanupOldTransactions(pendingTxs, 2*time.Minute)
 				}
-				
+
 				lastBlockNumber = currentBlockNum
-				
+
 				// Send new block signal to sender
 				select {
 				case s.newBlockChan <- currentBlockNum:
@@ -1172,7 +1188,7 @@ func (s *Scenario) runBlockMonitor(ctx context.Context) error {
 // processBlockTransactions processes all transactions in a block and returns confirmed count
 func (s *Scenario) processBlockTransactions(ctx context.Context, block *types.Block, pendingTxs map[common.Hash]*PendingTransaction) int {
 	confirmedCount := 0
-	
+
 	// Check each transaction in the block
 	for _, tx := range block.Transactions() {
 		// Check if this is one of our pending transactions
@@ -1182,27 +1198,27 @@ func (s *Scenario) processBlockTransactions(ctx context.Context, block *types.Bl
 			if client == nil {
 				continue
 			}
-			
+
 			receiptCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			receipt, err := client.GetEthClient().TransactionReceipt(receiptCtx, tx.Hash())
 			cancel()
-			
+
 			if err != nil {
 				s.logger.Warnf("Failed to get receipt for %s: %v", tx.Hash().Hex(), err)
 				continue
 			}
-			
+
 			// Process successful deployment
 			if receipt.Status == 1 && receipt.ContractAddress != (common.Address{}) {
 				s.recordDeployedContract(receipt.ContractAddress, pendingTx.PrivateKey, receipt, tx.Hash())
 				confirmedCount++
 			}
-			
+
 			// Remove from pending
 			delete(pendingTxs, tx.Hash())
 		}
 	}
-	
+
 	return confirmedCount
 }
 
@@ -1210,13 +1226,13 @@ func (s *Scenario) processBlockTransactions(ctx context.Context, block *types.Bl
 func (s *Scenario) cleanupOldTransactions(pendingTxs map[common.Hash]*PendingTransaction, timeout time.Duration) {
 	now := time.Now()
 	var toRemove []common.Hash
-	
+
 	for hash, tx := range pendingTxs {
 		if now.Sub(tx.Timestamp) > timeout {
 			toRemove = append(toRemove, hash)
 		}
 	}
-	
+
 	for _, hash := range toRemove {
 		delete(pendingTxs, hash)
 		s.logger.Debugf("Removed timed out transaction %s", hash.Hex())
@@ -1227,26 +1243,26 @@ func (s *Scenario) cleanupOldTransactions(pendingTxs map[common.Hash]*PendingTra
 func (s *Scenario) getStuckTransactions(pendingTxs map[common.Hash]*PendingTransaction, threshold time.Duration) map[common.Hash]*PendingTransaction {
 	stuckTxs := make(map[common.Hash]*PendingTransaction)
 	now := time.Now()
-	
+
 	for hash, tx := range pendingTxs {
 		if now.Sub(tx.Timestamp) > threshold {
 			stuckTxs[hash] = tx
 		}
 	}
-	
+
 	return stuckTxs
 }
 
 // sendAndTrackTransaction sends a single transaction and returns tx + private key for tracking
 func (s *Scenario) sendAndTrackTransaction(ctx context.Context, walletIdx uint64) (*types.Transaction, *ecdsa.PrivateKey, error) {
 	maxRetries := 3
-	
+
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		tx, privKey, err := s.attemptTransactionWithReturn(ctx, walletIdx, attempt)
 		if err == nil {
 			return tx, privKey, nil
 		}
-		
+
 		// Handle different error types
 		if strings.Contains(err.Error(), "replacement transaction underpriced") {
 			// Skip nonce conflicts quickly
@@ -1256,17 +1272,17 @@ func (s *Scenario) sendAndTrackTransaction(ctx context.Context, walletIdx uint64
 			}
 			continue
 		}
-		
+
 		if strings.Contains(err.Error(), "max fee per gas less than block base fee") {
 			// Update fees and retry
 			s.updateDynamicFees(ctx)
 			continue
 		}
-		
+
 		// For other errors, return immediately
 		return nil, nil, err
 	}
-	
+
 	return nil, nil, fmt.Errorf("failed after %d attempts", maxRetries)
 }
 
@@ -1293,7 +1309,7 @@ func (s *Scenario) sendTransaction(ctx context.Context, txIdx uint64) error {
 				for skippedNonces < maxNonceSkips {
 					oldNonce := wallet.GetNonce()
 					newNonce := wallet.GetNextNonce() // Skip the conflicting nonce
-					s.logger.Infof("Wallet %d skipped nonce %d, now using nonce %d", 
+					s.logger.Infof("Wallet %d skipped nonce %d, now using nonce %d",
 						txIdx, oldNonce, newNonce)
 					skippedNonces++
 
@@ -1310,7 +1326,7 @@ func (s *Scenario) sendTransaction(ctx context.Context, txIdx uint64) error {
 				}
 
 				if skippedNonces >= maxNonceSkips {
-					s.logger.Errorf("Wallet %d exceeded maximum nonce skips (%d), giving up", 
+					s.logger.Errorf("Wallet %d exceeded maximum nonce skips (%d), giving up",
 						txIdx, maxNonceSkips)
 					return fmt.Errorf("exceeded maximum nonce skips (%d) for wallet %d", maxNonceSkips, txIdx)
 				}
@@ -1357,18 +1373,18 @@ func (s *Scenario) updateDynamicFeesWithEscalation(ctx context.Context, escalate
 		// Check if we've reached maximum gas price limits (prevent infinite escalation)
 		maxBaseFee := uint64(1000) // 1000 gwei max base fee
 		maxTipFee := uint64(100)   // 100 gwei max tip fee
-		
+
 		if s.options.BaseFee >= maxBaseFee || s.options.TipFee >= maxTipFee {
 			s.maxGasPriceReached = true
 			s.logger.Errorf("ESCALATION LIMIT: Maximum gas prices reached (base: %d/%d gwei, tip: %d/%d gwei), stopping escalation",
 				s.options.BaseFee, maxBaseFee, s.options.TipFee, maxTipFee)
 			return fmt.Errorf("maximum gas price limit reached")
 		}
-		
+
 		// Aggressive escalation: add original fees to current fees
 		oldBaseFee := s.options.BaseFee
 		oldTipFee := s.options.TipFee
-		
+
 		s.options.BaseFee = s.options.BaseFee + s.originalBaseFee
 		s.options.TipFee = s.options.TipFee + s.originalTipFee
 
@@ -1385,11 +1401,11 @@ func (s *Scenario) updateDynamicFeesWithEscalation(ctx context.Context, escalate
 		s.logger.Warnf("ESCALATING gas prices due to stuck transactions - Base fee: %d -> %d gwei (+%d), Tip fee: %d -> %d gwei (+%d)",
 			oldBaseFee, s.options.BaseFee, s.originalBaseFee,
 			oldTipFee, s.options.TipFee, s.originalTipFee)
-		
+
 		if s.maxGasPriceReached {
 			s.logger.Warnf("Gas price escalation has reached maximum limits")
 		}
-		
+
 		return nil
 	}
 
@@ -1425,7 +1441,6 @@ func (s *Scenario) updateDynamicFeesWithEscalation(ctx context.Context, escalate
 	return nil
 }
 
-
 // attemptTransactionWithReturn builds and sends a transaction, returning the tx and private key
 func (s *Scenario) attemptTransactionWithReturn(ctx context.Context, walletIdx uint64, attempt int) (*types.Transaction, *ecdsa.PrivateKey, error) {
 	// Get client
@@ -1433,13 +1448,13 @@ func (s *Scenario) attemptTransactionWithReturn(ctx context.Context, walletIdx u
 	if client == nil {
 		return nil, nil, fmt.Errorf("no client available")
 	}
-	
+
 	// Get wallet
 	wallet := s.walletPool.GetWallet(spamoor.SelectWalletByIndex, int(walletIdx))
 	if wallet == nil {
 		return nil, nil, fmt.Errorf("no wallet available at index %d", walletIdx)
 	}
-	
+
 	// Generate random salt for unique contract
 	salt := make([]byte, 32)
 	_, err := rand.Read(salt)
@@ -1447,11 +1462,11 @@ func (s *Scenario) attemptTransactionWithReturn(ctx context.Context, walletIdx u
 		return nil, nil, fmt.Errorf("failed to generate salt: %w", err)
 	}
 	saltInt := new(big.Int).SetBytes(salt)
-	
+
 	// Use BuildBoundTx with timeout to prevent hanging
 	txCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	
+
 	tx, err := wallet.BuildBoundTx(txCtx, &txbuilder.TxMetadata{
 		GasFeeCap: uint256.MustFromBig(new(big.Int).Mul(big.NewInt(int64(s.options.BaseFee)), big.NewInt(1000000000))),
 		GasTipCap: uint256.MustFromBig(new(big.Int).Mul(big.NewInt(int64(s.options.TipFee)), big.NewInt(1000000000))),
@@ -1462,11 +1477,11 @@ func (s *Scenario) attemptTransactionWithReturn(ctx context.Context, walletIdx u
 		_, deployTx, _, err := contract.DeployContract(transactOpts, client.GetEthClient(), saltInt)
 		return deployTx, err
 	})
-	
+
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build and deploy contract: %w", err)
 	}
-	
+
 	// Send the transaction with timeout
 	sendCtx, cancelSend := context.WithTimeout(ctx, 3*time.Second)
 	defer cancelSend()
@@ -1474,7 +1489,7 @@ func (s *Scenario) attemptTransactionWithReturn(ctx context.Context, walletIdx u
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to send transaction: %w", err)
 	}
-	
+
 	return tx, wallet.GetPrivateKey(), nil
 }
 
@@ -1503,7 +1518,7 @@ func (s *Scenario) attemptTransaction(ctx context.Context, txIdx uint64, attempt
 	// Use BuildBoundTx with timeout to prevent hanging
 	txCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	
+
 	tx, err := wallet.BuildBoundTx(txCtx, &txbuilder.TxMetadata{
 		GasFeeCap: uint256.MustFromBig(new(big.Int).Mul(big.NewInt(int64(s.options.BaseFee)), big.NewInt(1000000000))),
 		GasTipCap: uint256.MustFromBig(new(big.Int).Mul(big.NewInt(int64(s.options.TipFee)), big.NewInt(1000000000))),
