@@ -319,8 +319,7 @@ func (s *Scenario) processPendingTransactions(ctx context.Context) {
 		if err != nil {
 			s.logger.Warnf("Failed to escalate gas prices: %v", err)
 		} else {
-			// Trigger immediate transaction sending with escalated prices
-			s.triggerImmediateTxSending(ctx, len(stuckTxs))
+			s.logger.Infof("Gas prices escalated successfully, will use new prices in next transaction batch")
 		}
 	}
 
@@ -965,40 +964,6 @@ func (s *Scenario) updateDynamicFeesWithEscalation(ctx context.Context, escalate
 	return nil
 }
 
-// triggerImmediateTxSending forces immediate transaction sending with escalated gas prices
-func (s *Scenario) triggerImmediateTxSending(ctx context.Context, stuckTxCount int) {
-	s.logger.Warnf("FORCING immediate transaction sending due to %d stuck transactions", stuckTxCount)
-	
-	// Start from wallet group 0 and send transactions for all groups
-	for groupIdx := uint64(0); groupIdx < 10; groupIdx++ {
-		groupStartIdx := groupIdx * s.walletsPerGroup
-		groupEndIdx := groupStartIdx + s.walletsPerGroup
-		
-		s.logger.Infof("FORCING transactions for wallet group %d of 10 (wallets %d-%d) with escalated prices",
-			groupIdx, groupStartIdx, groupEndIdx-1)
-		
-		// Send batch with escalated prices
-		err := s.sendBatchTransactions(ctx, 0, groupStartIdx, groupEndIdx) // Use 0 for baseIdx since we're forcing
-		if err != nil {
-			s.logger.Errorf("Failed to send forced batch for group %d: %v", groupIdx, err)
-		} else {
-			s.logger.Infof("Successfully sent forced batch for wallet group %d", groupIdx)
-		}
-		
-		// Small delay between groups to avoid overwhelming the network
-		time.Sleep(1 * time.Second)
-		
-		// Check context cancellation between groups
-		select {
-		case <-ctx.Done():
-			s.logger.Warnf("Context cancelled during forced transaction sending")
-			return
-		default:
-		}
-	}
-	
-	s.logger.Infof("Completed forced transaction sending across all 10 wallet groups")
-}
 
 // attemptTransaction makes a single attempt to send a transaction
 func (s *Scenario) attemptTransaction(ctx context.Context, txIdx uint64, attempt int) error {
