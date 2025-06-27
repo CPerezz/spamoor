@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -50,7 +51,7 @@ const (
 	EstimatedDeployGas = uint64(500000) // Deployment gas for our contract
 
 	// Safety margins and multipliers
-	GasLimitSafetyMargin = 0.99 // Use 99% of block gas limit (1% margin for gas price variations)
+	GasLimitSafetyMargin = 0.99 // Use 99% of block gas limit (EstimateGas ensures affordability)
 	
 	// Deployment tracking file
 	DeploymentFileName = "deployments_sstore_bloating.json"
@@ -415,7 +416,13 @@ func (s *Scenario) sendCreateSlotsTransaction(ctx context.Context, client *spamo
 		}
 	}()
 
-	// Calculate slots to create based on gas limits
+	// Get suggested fees first
+	feeCap, tipCap, err := s.walletPool.GetTxPool().GetSuggestedFees(client, s.options.BaseFee, s.options.TipFee)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get suggested fees: %w", err)
+	}
+
+	// Calculate initial slots to create based on gas limits
 	s.gasTrackingLock.RLock()
 	gasPerSlot := s.actualGasPerNewSlotIteration
 	s.gasTrackingLock.RUnlock()
@@ -433,21 +440,62 @@ func (s *Scenario) sendCreateSlotsTransaction(ctx context.Context, client *spamo
 		slotsToCreate = maxSlotsPerTx
 	}
 
-	s.logger.Debugf("Gas calculations: targetGas=%d, availableGas=%d, gasPerSlot=%d, slotsToCreate=%d",
-		targetGas, availableGas, gasPerSlot, slotsToCreate)
-
-	// Get suggested fees
-	feeCap, tipCap, err := s.walletPool.GetTxPool().GetSuggestedFees(client, s.options.BaseFee, s.options.TipFee)
+	// Encode the transaction data for gas estimation
+	data, err := s.contractABI.Pack("createSlots", big.NewInt(int64(slotsToCreate)))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get suggested fees: %w", err)
+		return nil, fmt.Errorf("failed to pack transaction data: %w", err)
 	}
+
+	// Estimate gas for the actual transaction
+	msg := ethereum.CallMsg{
+		From:     wallet.GetAddress(),
+		To:       &s.contractAddress,
+		GasPrice: feeCap,
+		Value:    big.NewInt(0),
+		Data:     data,
+	}
+
+	estimatedGas, err := client.GetEthClient().EstimateGas(ctx, msg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to estimate gas: %w", err)
+	}
+
+	// Add 10% buffer to the estimate
+	adjustedGas := uint64(float64(estimatedGas) * 1.1)
+	
+	// Check wallet balance
+	walletBalance := wallet.GetBalance()
+	txCost := new(big.Int).Mul(feeCap, big.NewInt(int64(adjustedGas)))
+	
+	if walletBalance.Cmp(txCost) < 0 {
+		// Try to reduce slots to fit wallet balance
+		maxAffordableGas := new(big.Int).Div(walletBalance, feeCap)
+		if !maxAffordableGas.IsUint64() {
+			return nil, fmt.Errorf("wallet balance too low")
+		}
+		
+		// Calculate slots we can afford (with safety margin)
+		affordableGas := uint64(float64(maxAffordableGas.Uint64()) * 0.9)
+		if affordableGas < estimatedGas/uint64(slotsToCreate)*100 { // Need at least 100 slots
+			return nil, fmt.Errorf("insufficient balance for minimum transaction")
+		}
+		
+		// Adjust slots proportionally
+		slotsToCreate = (affordableGas - BaseTxCost - FunctionCallOverhead) / gasPerSlot
+		adjustedGas = affordableGas
+		
+		s.logger.Warnf("Reduced slots from original to %d due to wallet balance", slotsToCreate)
+	}
+
+	s.logger.Debugf("Gas estimation: estimated=%d, adjusted=%d, slots=%d",
+		estimatedGas, adjustedGas, slotsToCreate)
 
 	// Build transaction using BuildBoundTx
 	tx, err := wallet.BuildBoundTx(ctx, &txbuilder.TxMetadata{
 		To:        &s.contractAddress,
 		GasFeeCap: uint256.MustFromBig(feeCap),
 		GasTipCap: uint256.MustFromBig(tipCap),
-		Gas:       targetGas,
+		Gas:       adjustedGas,
 	}, func(transactOpts *bind.TransactOpts) (*types.Transaction, error) {
 		return s.contractInstance.CreateSlots(transactOpts, big.NewInt(int64(slotsToCreate)))
 	})
