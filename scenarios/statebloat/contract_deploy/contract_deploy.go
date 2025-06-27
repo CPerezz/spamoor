@@ -946,11 +946,19 @@ func (s *Scenario) sendBatchTransactionsWithTracking(ctx context.Context, baseId
 	errors := make(chan error, endIdx-startIdx)
 	successfulTxs := make(chan *PendingTransaction, endIdx-startIdx)
 
+	// Limit concurrent RPC requests to avoid overwhelming the client
+	maxConcurrent := uint64(15) // Allow max 15 concurrent requests
+	semaphore := make(chan struct{}, maxConcurrent)
+
 	// Send one transaction per wallet in the group
 	for walletIdx := startIdx; walletIdx < endIdx; walletIdx++ {
 		wg.Add(1)
 		go func(idx uint64) {
 			defer wg.Done()
+
+			// Acquire semaphore slot
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
 			// Send transaction and track it
 			if tx, privKey, err := s.sendAndTrackTransaction(ctx, idx); err != nil {
@@ -1255,7 +1263,7 @@ func (s *Scenario) getStuckTransactions(pendingTxs map[common.Hash]*PendingTrans
 
 // sendAndTrackTransaction sends a single transaction and returns tx + private key for tracking
 func (s *Scenario) sendAndTrackTransaction(ctx context.Context, walletIdx uint64) (*types.Transaction, *ecdsa.PrivateKey, error) {
-	maxRetries := 3
+	maxRetries := 5 // Increased retries for timeout handling
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		tx, privKey, err := s.attemptTransactionWithReturn(ctx, walletIdx, attempt)
@@ -1277,6 +1285,22 @@ func (s *Scenario) sendAndTrackTransaction(ctx context.Context, walletIdx uint64
 			// Update fees and retry
 			s.updateDynamicFees(ctx)
 			continue
+		}
+
+		// Handle timeout errors with exponential backoff
+		if strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "timeout") {
+			if attempt < maxRetries-1 {
+				// Exponential backoff: 200ms, 400ms, 800ms, 1600ms
+				backoffDuration := time.Duration(200*(1<<attempt)) * time.Millisecond
+				s.logger.Debugf("Wallet %d timeout on attempt %d, retrying in %v", walletIdx, attempt+1, backoffDuration)
+				
+				select {
+				case <-time.After(backoffDuration):
+					continue
+				case <-ctx.Done():
+					return nil, nil, ctx.Err()
+				}
+			}
 		}
 
 		// For other errors, return immediately
@@ -1443,10 +1467,15 @@ func (s *Scenario) updateDynamicFeesWithEscalation(ctx context.Context, escalate
 
 // attemptTransactionWithReturn builds and sends a transaction, returning the tx and private key
 func (s *Scenario) attemptTransactionWithReturn(ctx context.Context, walletIdx uint64, attempt int) (*types.Transaction, *ecdsa.PrivateKey, error) {
-	// Get client
-	client := s.walletPool.GetClient(spamoor.SelectClientRoundRobin, 0, "")
+	// Rotate clients based on wallet index + attempt to distribute load
+	clientOffset := int(walletIdx%10) + attempt
+	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, clientOffset, s.options.ClientGroup)
 	if client == nil {
-		return nil, nil, fmt.Errorf("no client available")
+		// Fallback to round robin if specific client not available
+		client = s.walletPool.GetClient(spamoor.SelectClientRoundRobin, 0, "")
+		if client == nil {
+			return nil, nil, fmt.Errorf("no client available")
+		}
 	}
 
 	// Get wallet
@@ -1482,8 +1511,8 @@ func (s *Scenario) attemptTransactionWithReturn(ctx context.Context, walletIdx u
 		return nil, nil, fmt.Errorf("failed to build and deploy contract: %w", err)
 	}
 
-	// Send the transaction with timeout
-	sendCtx, cancelSend := context.WithTimeout(ctx, 3*time.Second)
+	// Send the transaction with increased timeout for heavy load
+	sendCtx, cancelSend := context.WithTimeout(ctx, 15*time.Second)
 	defer cancelSend()
 	err = client.SendTransaction(sendCtx, tx)
 	if err != nil {
@@ -1534,8 +1563,8 @@ func (s *Scenario) attemptTransaction(ctx context.Context, txIdx uint64, attempt
 		return fmt.Errorf("failed to build and deploy contract: %w", err)
 	}
 
-	// Send the transaction with timeout
-	sendCtx, cancelSend := context.WithTimeout(ctx, 3*time.Second)
+	// Send the transaction with increased timeout for heavy load
+	sendCtx, cancelSend := context.WithTimeout(ctx, 15*time.Second)
 	defer cancelSend()
 	err = client.SendTransaction(sendCtx, tx)
 	if err != nil {
