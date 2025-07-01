@@ -162,11 +162,8 @@ func (s *Scenario) Init(options *scenario.Options) error {
 		}
 	}
 
-	// Use multiple child wallets for better throughput
-	// Set a reasonable number based on expected throughput
-	if s.walletPool.GetConfiguredWalletCount() < 10 {
-		s.walletPool.SetWalletCount(10)
-	}
+	// Use only one child wallet since we send one tx per block
+	s.walletPool.SetWalletCount(1)
 
 	// Parse contract ABI
 	parsedABI, err := abi.JSON(strings.NewReader(string(contractABIBytes)))
@@ -355,67 +352,107 @@ func (s *Scenario) Run(ctx context.Context) error {
 		s.flushDeploymentBuffer()
 	}()
 
-	// Run transaction scenario with controlled throughput
-	// We want exactly 1 transaction per block to maximize gas usage
-	err := scenario.RunTransactionScenario(ctx, scenario.TransactionScenarioOptions{
-		TotalCount: 0, // Run indefinitely
-		Throughput: 1, // 1 transaction per slot (block)
-		MaxPending: 1, // Only 1 transaction at a time to ensure sequential execution
-		WalletPool: s.walletPool,
-		Logger:     s.logger,
-		ProcessNextTxFn: s.processNextTransaction,
-	})
-
-	return err
+	// Custom loop for single transaction per block
+	return s.runSingleTxPerBlock(ctx)
 }
 
-// processNextTransaction is called by RunTransactionScenario for each transaction
-func (s *Scenario) processNextTransaction(ctx context.Context, txIdx uint64, onComplete func()) (func(), error) {
-	// Get client and wallet
-	client := s.walletPool.GetClient(spamoor.SelectClientRoundRobin, 0, "")
-	walletIdx := int(txIdx % uint64(s.walletPool.GetConfiguredWalletCount()))
-	wallet := s.walletPool.GetWallet(spamoor.SelectWalletByIndex, walletIdx)
-
-	if client == nil || wallet == nil {
-		onComplete()
-		return nil, fmt.Errorf("no client or wallet available")
+// runSingleTxPerBlock implements the custom loop for one transaction per block
+func (s *Scenario) runSingleTxPerBlock(ctx context.Context) error {
+	// Get single wallet and client
+	wallet := s.walletPool.GetWallet(spamoor.SelectWalletByIndex, 0)
+	if wallet == nil {
+		return fmt.Errorf("no wallet available")
 	}
 
-	// Get current block gas limit dynamically
-	latestBlock, err := client.GetEthClient().BlockByNumber(ctx, nil)
-	if err != nil {
-		onComplete()
-		return nil, fmt.Errorf("failed to get latest block: %w", err)
-	}
+	var txCount uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 
-	blockGasLimit := latestBlock.GasLimit()
-	targetGas := uint64(float64(blockGasLimit) * GasLimitSafetyMargin)
+		// Get client (may change due to failover)
+		client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, "")
+		if client == nil {
+			s.logger.Warn("no client available, waiting...")
+			time.Sleep(5 * time.Second)
+			continue
+		}
 
-	// Send transaction
-	tx, err := s.sendCreateSlotsTransaction(ctx, client, wallet, targetGas, blockGasLimit, onComplete)
-	if err != nil {
-		return nil, err
-	}
+		// Use cached gas limit
+		s.cachedGasLimitLock.RLock()
+		blockGasLimit := s.cachedGasLimit
+		s.cachedGasLimitLock.RUnlock()
 
-	// Return logging function
-	return func() {
+		targetGas := uint64(float64(blockGasLimit) * GasLimitSafetyMargin)
+
+		// Send transaction and wait for confirmation
+		tx, receipt, err := s.sendAndWaitForTransaction(ctx, client, wallet, targetGas, blockGasLimit)
 		if err != nil {
-			s.logger.WithField("wallet", walletIdx).Warnf("failed to send tx: %v", err)
-		} else {
-			s.logger.WithField("wallet", walletIdx).Debugf("sent tx: %v", tx.Hash())
+			if strings.Contains(err.Error(), "context canceled") {
+				return nil
+			}
+			s.logger.Warnf("failed to send transaction: %v", err)
+			// Wait a bit before retry
+			time.Sleep(2 * time.Second)
+			continue
 		}
-	}, err
+
+		txCount++
+		s.logger.WithFields(logrus.Fields{
+			"tx":       tx.Hash().Hex(),
+			"block":    receipt.BlockNumber,
+			"gas_used": receipt.GasUsed,
+			"total_tx": txCount,
+		}).Info("Transaction confirmed")
+	}
 }
 
-// sendCreateSlotsTransaction builds and sends a single createSlots transaction
-func (s *Scenario) sendCreateSlotsTransaction(ctx context.Context, client *spamoor.Client, wallet *spamoor.Wallet, targetGas uint64, blockGasLimit uint64, onComplete func()) (*types.Transaction, error) {
-	transactionSubmitted := false
-	defer func() {
-		if !transactionSubmitted {
-			onComplete()
-		}
-	}()
+// sendAndWaitForTransaction sends a transaction and waits for it to be mined
+func (s *Scenario) sendAndWaitForTransaction(ctx context.Context, client *spamoor.Client, wallet *spamoor.Wallet, targetGas uint64, blockGasLimit uint64) (*types.Transaction, *types.Receipt, error) {
+	// Build and send the transaction
+	tx, err := s.buildCreateSlotsTransaction(ctx, client, wallet, targetGas, blockGasLimit)
+	if err != nil {
+		return nil, nil, err
+	}
 
+	// Send transaction and wait for confirmation
+	receipt, err := s.walletPool.GetTxPool().SendAndAwaitTransaction(ctx, wallet, tx, &spamoor.SendTransactionOptions{
+		Client:      client,
+		Rebroadcast: true,
+	})
+	if err != nil {
+		// Reset nonce on error
+		wallet.ResetPendingNonce(ctx, client)
+		return nil, nil, err
+	}
+
+	if receipt.Status != 1 {
+		return tx, receipt, fmt.Errorf("transaction failed")
+	}
+
+	// Update metrics from receipt
+	// Extract slots created from tx data
+	slotsCreated := s.extractSlotsFromTx(tx)
+	s.updateMetricsFromReceipt(receipt, slotsCreated, blockGasLimit)
+
+	return tx, receipt, nil
+}
+
+// extractSlotsFromTx extracts the number of slots from transaction data
+func (s *Scenario) extractSlotsFromTx(tx *types.Transaction) uint64 {
+	if len(tx.Data()) < 36 { // 4 bytes selector + 32 bytes uint256
+		return 0
+	}
+	
+	// Skip function selector (first 4 bytes) and read the uint256 parameter
+	slotsBig := new(big.Int).SetBytes(tx.Data()[4:36])
+	return slotsBig.Uint64()
+}
+
+// buildCreateSlotsTransaction builds a single createSlots transaction
+func (s *Scenario) buildCreateSlotsTransaction(ctx context.Context, client *spamoor.Client, wallet *spamoor.Wallet, targetGas uint64, blockGasLimit uint64) (*types.Transaction, error) {
 	// Get suggested fees first
 	feeCap, tipCap, err := s.walletPool.GetTxPool().GetSuggestedFees(client, s.options.BaseFee, s.options.TipFee)
 	if err != nil {
@@ -503,33 +540,10 @@ func (s *Scenario) sendCreateSlotsTransaction(ctx context.Context, client *spamo
 		return nil, fmt.Errorf("failed to build transaction: %w", err)
 	}
 
-	// Submit transaction
-	transactionSubmitted = true
-	err = s.walletPool.GetTxPool().SendTransaction(ctx, wallet, tx, &spamoor.SendTransactionOptions{
-		Client:      client,
-		Rebroadcast: true,
-		OnComplete: func(tx *types.Transaction, receipt *types.Receipt, err error) {
-			onComplete()
-		},
-		OnConfirm: func(tx *types.Transaction, receipt *types.Receipt) {
-			// Update metrics asynchronously
-			go s.updateMetricsFromReceipt(receipt, slotsToCreate, blockGasLimit)
-		},
-	})
-
-	if err != nil {
-		// Reset nonce if tx was not sent
-		wallet.ResetPendingNonce(ctx, client)
-		return nil, err
-	}
-
 	return tx, nil
 }
 
-func (s *Scenario) executeCreateSlots(ctx context.Context, targetGas uint64, blockGasLimit uint64) error {
-	// This method is now removed - functionality moved to processNextTransaction
-	return fmt.Errorf("deprecated method")
-}
+
 
 // updateMetricsFromReceipt updates scenario metrics from a confirmed transaction
 func (s *Scenario) updateMetricsFromReceipt(receipt *types.Receipt, slotsCreated uint64, blockGasLimit uint64) {
