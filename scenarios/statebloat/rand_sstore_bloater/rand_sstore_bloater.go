@@ -51,7 +51,7 @@ const (
 	EstimatedDeployGas = uint64(500000) // Deployment gas for our contract
 
 	// Safety margins and multipliers
-	GasLimitSafetyMargin = 0.99 // Use 99% of block gas limit (EstimateGas ensures affordability)
+	GasLimitSafetyMargin = 0.90 // Start with 90% of block gas limit for initial estimate
 	
 	// Deployment tracking file
 	DeploymentFileName = "deployments_sstore_bloating.json"
@@ -386,6 +386,9 @@ func (s *Scenario) runSingleTxPerBlock(ctx context.Context) error {
 		s.cachedGasLimitLock.RUnlock()
 
 		targetGas := uint64(float64(blockGasLimit) * GasLimitSafetyMargin)
+		
+		s.logger.Debugf("Attempting transaction with blockGasLimit=%d, targetGas=%d (%.0f%%)", 
+			blockGasLimit, targetGas, GasLimitSafetyMargin*100)
 
 		// Send transaction and wait for confirmation
 		tx, receipt, err := s.sendAndWaitForTransaction(ctx, client, wallet, targetGas, blockGasLimit)
@@ -465,36 +468,22 @@ func (s *Scenario) buildCreateSlotsTransaction(ctx context.Context, client *spam
 	s.gasTrackingLock.RUnlock()
 
 	availableGas := targetGas - BaseTxCost - FunctionCallOverhead
-	slotsToCreate := availableGas / gasPerSlot
+	initialSlotsEstimate := availableGas / gasPerSlot
 
-	if slotsToCreate == 0 {
+	if initialSlotsEstimate == 0 {
 		return nil, fmt.Errorf("not enough gas to create any slots")
 	}
 
 	// Cap slots to reasonable maximum
 	maxSlotsPerTx := uint64(5200)
-	if slotsToCreate > maxSlotsPerTx {
-		slotsToCreate = maxSlotsPerTx
+	if initialSlotsEstimate > maxSlotsPerTx {
+		initialSlotsEstimate = maxSlotsPerTx
 	}
 
-	// Encode the transaction data for gas estimation
-	data, err := s.contractABI.Pack("createSlots", big.NewInt(int64(slotsToCreate)))
+	// Find optimal slot count using binary search
+	slotsToCreate, estimatedGas, err := s.findOptimalSlotCount(ctx, client, wallet, feeCap, initialSlotsEstimate, 100)
 	if err != nil {
-		return nil, fmt.Errorf("failed to pack transaction data: %w", err)
-	}
-
-	// Estimate gas for the actual transaction
-	msg := ethereum.CallMsg{
-		From:     wallet.GetAddress(),
-		To:       &s.contractAddress,
-		GasPrice: feeCap,
-		Value:    big.NewInt(0),
-		Data:     data,
-	}
-
-	estimatedGas, err := client.GetEthClient().EstimateGas(ctx, msg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to estimate gas: %w", err)
+		return nil, fmt.Errorf("failed to find optimal slot count: %w", err)
 	}
 
 	// Add 10% buffer to the estimate
@@ -524,8 +513,14 @@ func (s *Scenario) buildCreateSlotsTransaction(ctx context.Context, client *spam
 		s.logger.Warnf("Reduced slots from original to %d due to wallet balance", slotsToCreate)
 	}
 
-	s.logger.Debugf("Gas estimation: estimated=%d, adjusted=%d, slots=%d",
-		estimatedGas, adjustedGas, slotsToCreate)
+	s.logger.WithFields(logrus.Fields{
+		"initial_estimate": initialSlotsEstimate,
+		"final_slots":      slotsToCreate,
+		"estimated_gas":    estimatedGas,
+		"adjusted_gas":     adjustedGas,
+		"block_gas_limit":  blockGasLimit,
+		"target_gas":       targetGas,
+	}).Info("Transaction gas calculation completed")
 
 	// Build transaction using BuildBoundTx
 	tx, err := wallet.BuildBoundTx(ctx, &txbuilder.TxMetadata{
@@ -541,6 +536,63 @@ func (s *Scenario) buildCreateSlotsTransaction(ctx context.Context, client *spam
 	}
 
 	return tx, nil
+}
+
+// findOptimalSlotCount uses binary search to find the maximum number of slots that can fit in a transaction
+func (s *Scenario) findOptimalSlotCount(ctx context.Context, client *spamoor.Client, wallet *spamoor.Wallet, gasPrice *big.Int, maxSlots uint64, minSlots uint64) (uint64, uint64, error) {
+	lowerBound := minSlots
+	upperBound := maxSlots
+	var lastSuccessfulSlots uint64
+	var lastSuccessfulGas uint64
+
+	s.logger.Debugf("Starting binary search for optimal slots: min=%d, max=%d", minSlots, maxSlots)
+
+	// Binary search for optimal slot count
+	for lowerBound <= upperBound {
+		midSlots := (lowerBound + upperBound) / 2
+		
+		// Pack transaction data
+		data, err := s.contractABI.Pack("createSlots", big.NewInt(int64(midSlots)))
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to pack transaction data: %w", err)
+		}
+
+		// Try to estimate gas
+		msg := ethereum.CallMsg{
+			From:     wallet.GetAddress(),
+			To:       &s.contractAddress,
+			GasPrice: gasPrice,
+			Value:    big.NewInt(0),
+			Data:     data,
+		}
+
+		estimatedGas, err := client.GetEthClient().EstimateGas(ctx, msg)
+		if err != nil {
+			errStr := err.Error()
+			if strings.Contains(errStr, "gas required exceeds allowance") || 
+			   strings.Contains(errStr, "exceeds block gas limit") {
+				// Too many slots, reduce upper bound
+				s.logger.Debugf("Gas exceeds limit for %d slots, reducing", midSlots)
+				upperBound = midSlots - 1
+			} else {
+				// Other error, return it
+				return 0, 0, fmt.Errorf("gas estimation failed: %w", err)
+			}
+		} else {
+			// Success! Try to go higher
+			lastSuccessfulSlots = midSlots
+			lastSuccessfulGas = estimatedGas
+			s.logger.Debugf("Successfully estimated %d gas for %d slots", estimatedGas, midSlots)
+			lowerBound = midSlots + 1
+		}
+	}
+
+	if lastSuccessfulSlots == 0 {
+		return 0, 0, fmt.Errorf("could not find any valid slot count")
+	}
+
+	s.logger.Infof("Found optimal slot count: %d slots requiring %d gas", lastSuccessfulSlots, lastSuccessfulGas)
+	return lastSuccessfulSlots, lastSuccessfulGas, nil
 }
 
 
