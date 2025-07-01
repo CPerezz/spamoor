@@ -99,6 +99,7 @@ type Scenario struct {
 	deployerAddress    common.Address
 	deployerWallet     *spamoor.Wallet
 	deployedContracts  []common.Address
+	contractInstances  map[common.Address]*contract.Contract
 	contractIndex      int // Round-robin index
 
 	// Contract ABI
@@ -136,9 +137,10 @@ var ScenarioDescriptor = scenario.Descriptor{
 
 func newScenario(logger logrus.FieldLogger) scenario.Scenario {
 	return &Scenario{
-		logger:        logger.WithField("scenario", ScenarioName),
-		contractStats: make(map[common.Address]*ContractBloatStats),
-		logChannel:    make(chan *LogEntry, 1000),
+		logger:            logger.WithField("scenario", ScenarioName),
+		contractStats:     make(map[common.Address]*ContractBloatStats),
+		contractInstances: make(map[common.Address]*contract.Contract),
+		logChannel:        make(chan *LogEntry, 1000),
 	}
 }
 
@@ -348,6 +350,29 @@ func (s *Scenario) initializeDeployerWallet(ctx context.Context) error {
 	return nil
 }
 
+// initializeContractInstances creates contract instances for all deployed contracts
+func (s *Scenario) initializeContractInstances(ctx context.Context) error {
+	if len(s.contractInstances) > 0 {
+		return nil // Already initialized
+	}
+
+	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, "")
+	if client == nil {
+		return fmt.Errorf("no client available")
+	}
+
+	for _, contractAddr := range s.deployedContracts {
+		contractInstance, err := contract.NewContract(contractAddr, client.GetEthClient())
+		if err != nil {
+			return fmt.Errorf("failed to create contract instance for %s: %w", contractAddr.Hex(), err)
+		}
+		s.contractInstances[contractAddr] = contractInstance
+	}
+
+	s.logger.Infof("Initialized %d contract instances", len(s.contractInstances))
+	return nil
+}
+
 func (s *Scenario) Run(ctx context.Context) error {
 	s.logger.Infof("starting scenario: %s", ScenarioName)
 	defer s.logger.Infof("scenario %s finished.", ScenarioName)
@@ -357,6 +382,11 @@ func (s *Scenario) Run(ctx context.Context) error {
 		if err := s.initializeDeployerWallet(ctx); err != nil {
 			return err
 		}
+	}
+
+	// Initialize contract instances
+	if err := s.initializeContractInstances(ctx); err != nil {
+		return err
 	}
 
 	// Start async logger
@@ -487,56 +517,27 @@ func (s *Scenario) buildMultiTransferTransaction(ctx context.Context, contractAd
 		recipients[i] = s.generateRandomRecipient()
 	}
 
-	// Build transaction with batch transfer call data
-	callData, err := s.encodeMultipleTransfers(recipients)
-	if err != nil {
-		return nil, nil, err
+	// Get the contract instance
+	contractInstance, exists := s.contractInstances[contractAddr]
+	if !exists {
+		return nil, nil, fmt.Errorf("no contract instance found for %s", contractAddr.Hex())
 	}
 
 	// Calculate gas needed for batch transfer
 	gasLimit := uint64(BaseTransactionGas + BatchFunctionOverhead + (GasPerBatchTransfer * uint64(len(recipients))))
 
-	// Build transaction using BuildBoundTx
+	// Build transaction using BuildBoundTx with contract instance
 	tx, err := s.deployerWallet.BuildBoundTx(ctx, &txbuilder.TxMetadata{
 		GasFeeCap: uint256.MustFromBig(feeCap),
 		GasTipCap: uint256.MustFromBig(tipCap),
 		Gas:       gasLimit,
-		To:        &contractAddr,
-		Value:     uint256.NewInt(0),
-		Data:      callData,
 	}, func(transactOpts *bind.TransactOpts) (*types.Transaction, error) {
-		// Get the chain ID from the client
-		chainID, err := client.GetEthClient().ChainID(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get chain ID: %w", err)
-		}
-		
-		// For raw data transactions, we need to include the chain ID
-		// The BuildBoundTx will handle nonce, gas prices, and signing
-		return types.NewTx(&types.DynamicFeeTx{
-			ChainID:   chainID,
-			To:        &contractAddr,
-			Data:      callData,
-			Gas:       gasLimit,
-			Value:     big.NewInt(0),
-			GasFeeCap: feeCap,
-			GasTipCap: tipCap,
-		}), nil
+		return contractInstance.BatchTransfer(transactOpts, recipients)
 	})
 
 	return tx, recipients, err
 }
 
-// encodeMultipleTransfers encodes a batch transfer call
-func (s *Scenario) encodeMultipleTransfers(recipients []common.Address) ([]byte, error) {
-	if len(recipients) == 0 {
-		return nil, fmt.Errorf("no recipients")
-	}
-	
-	// Pack batch transfer call with all recipients
-	// Note: The contract's batchTransfer function uses a fixed amount of 1 token per recipient
-	return s.contractABI.Pack("batchTransfer", recipients)
-}
 
 // updateContractStats updates the statistics for a contract when transfers are confirmed
 func (s *Scenario) updateContractStats(contractAddr common.Address, recipientCount int) {
