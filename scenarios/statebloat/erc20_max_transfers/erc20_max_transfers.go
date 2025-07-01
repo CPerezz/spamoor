@@ -505,13 +505,22 @@ func (s *Scenario) buildMultiTransferTransaction(ctx context.Context, contractAd
 		Value:     uint256.NewInt(0),
 		Data:      callData,
 	}, func(transactOpts *bind.TransactOpts) (*types.Transaction, error) {
-		// For raw data transactions, we just return a transaction with the data
+		// Get the chain ID from the client
+		chainID, err := client.GetEthClient().ChainID(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get chain ID: %w", err)
+		}
+		
+		// For raw data transactions, we need to include the chain ID
 		// The BuildBoundTx will handle nonce, gas prices, and signing
 		return types.NewTx(&types.DynamicFeeTx{
-			To:    &contractAddr,
-			Data:  callData,
-			Gas:   gasLimit,
-			Value: big.NewInt(0),
+			ChainID:   chainID,
+			To:        &contractAddr,
+			Data:      callData,
+			Gas:       gasLimit,
+			Value:     big.NewInt(0),
+			GasFeeCap: feeCap,
+			GasTipCap: tipCap,
 		}), nil
 	})
 
