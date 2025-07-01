@@ -2,6 +2,8 @@
 
 This scenario deploys contracts that are exactly 24kB in size (EIP-170 limit) to maximize state growth while minimizing gas cost.
 
+**Note**: The deployed StateBloatToken contract includes an optimized `batchTransfer` function that allows sending tokens to multiple recipients in a single transaction. This is used by the erc20_max_transfers scenario to maximize state bloat efficiency.
+
 ## How it Works
 
 1. Generates a contract with exactly 24,576 bytes of runtime code

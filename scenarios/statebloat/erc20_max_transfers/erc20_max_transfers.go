@@ -3,8 +3,6 @@ package erc20maxtransfers
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -17,7 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
-	//"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/holiman/uint256"
@@ -32,46 +30,29 @@ import (
 
 // Constants for ERC20 transfer operations
 const (
-	// ERC20TransferGasCost - gas cost for a standard ERC20 transfer (updated to 70K)
-	ERC20TransferGasCost = 70000
-	// DefaultBaseFeeGwei - default base fee in gwei
+	// Gas costs for batch transfers (no events, no checks)
+	BaseTransactionGas        = 21000  // Base transaction cost
+	BatchFunctionOverhead     = 3000   // Function selector + array processing overhead
+	GasPerBatchTransfer      = 50000  // Gas per transfer in batch (SSTORE + balance updates, no event)
+	
+	// Default fees
 	DefaultBaseFeeGwei = 10
-	// DefaultTipFeeGwei - default tip fee in gwei
-	DefaultTipFeeGwei = 5
-	// TokenTransferAmount - amount of tokens to transfer (1 token in smallest unit)
-	TokenTransferAmount = 1
-	// DefaultTargetGasRatio - target percentage of block gas limit to use (99.5% for minimal safety margin)
-	DefaultTargetGasRatio = 0.995
-	// FallbackBlockGasLimit - fallback gas limit if network query fails
+	DefaultTipFeeGwei  = 2
+	
+	// Token amounts
+	TokenTransferAmount = 1 // 1 token in smallest unit
+	
+	// Gas optimization
+	DefaultTargetGasRatio = 0.95  // Target 95% of block gas limit
 	FallbackBlockGasLimit = 30000000
-	// GweiPerEth - conversion factor from Gwei to Wei
-	GweiPerEth = 1000000000
-	// BlockMiningTimeout - timeout for waiting for a new block to be mined
-	BlockMiningTimeout = 30 * time.Second
-	// BlockPollingInterval - interval for checking new blocks
-	BlockPollingInterval = 1 * time.Second
-	// TransactionBatchSize - number of transactions to send in a batch
-	TransactionBatchSize = 100
-	// TransactionBatchThreshold - threshold for continuing to fill a block
-	TransactionBatchThreshold = 50
-	// InitialTransactionDelay - delay between initial transactions
-	InitialTransactionDelay = 10 * time.Millisecond
-	// OptimizedTransactionDelay - reduced delay after initial batch
-	OptimizedTransactionDelay = 5 * time.Millisecond
-	// ConfirmationDelay - delay before checking confirmations
-	ConfirmationDelay = 2 * time.Second
-	// MaxRebroadcasts - maximum number of times to rebroadcast a transaction
-	MaxRebroadcasts = 10
-	// RetryDelay - delay before retrying failed operations
-	RetryDelay = 5 * time.Second
-	// GasPerMillion - divisor for converting gas to millions
-	GasPerMillion = 1_000_000.0
-	// BytesPerKiB - bytes in a kibibyte
-	BytesPerKiB = 1024.0
-	// EstimatedStateGrowthPerTransfer - estimated state growth in bytes per new recipient
-	EstimatedStateGrowthPerTransfer = 100
-	// BloatingSummaryFileName - name of the bloating summary file
-	BloatingSummaryFileName = "erc20_bloating_summary.json"
+	
+	// State growth tracking
+	EstimatedStateGrowthPerTransfer = 100 // bytes per new recipient
+	BloatingSummaryFileName         = "erc20_bloating_summary.json"
+	
+	// Timing constants
+	BlockPollingInterval = 500 * time.Millisecond
+	BlockMiningTimeout   = 30 * time.Second
 )
 
 // ScenarioOptions defines the configuration options for the scenario
@@ -97,31 +78,47 @@ type BloatingSummary struct {
 	LastBlockUpdate time.Time                      `json:"last_block_update"`
 }
 
+// LogEntry represents a transfer batch log entry
+type LogEntry struct {
+	Contract    common.Address
+	Recipients  []common.Address
+	GasUsed     uint64
+	BlockNumber uint64
+	TxHash      common.Hash
+	Timestamp   time.Time
+}
+
 // Scenario implements the ERC20 max transfers scenario
 type Scenario struct {
 	options    ScenarioOptions
 	logger     *logrus.Entry
 	walletPool *spamoor.WalletPool
 
-	// Deployed contracts and private key
-	deployerPrivateKey   string
-	deployerAddress      common.Address
-	deployerWallet       *spamoor.Wallet // Store the wallet instance
-	deployedContracts    []common.Address
-	currentRoundContract common.Address // Contract being used for current round
-	contractsLock        sync.Mutex
+	// Deployed contracts and deployer wallet
+	deployerPrivateKey string
+	deployerAddress    common.Address
+	deployerWallet     *spamoor.Wallet
+	deployedContracts  []common.Address
+	contractIndex      int // Round-robin index
 
-	// Transfer function ABI
-	transferABI abi.Method
-	contractABI abi.ABI
+	// Contract ABI
+	transferABI      abi.Method
+	batchTransferABI abi.Method
+	contractABI      abi.ABI
 
-	// Used addresses tracking
-	usedAddresses     map[common.Address]bool
-	usedAddressesLock sync.Mutex
+	// Async logging
+	logChannel chan *LogEntry
+	loggerWg   sync.WaitGroup
 
-	// Bloating statistics tracking
+	// Statistics tracking
+	totalRecipients   uint64
+	totalGasUsed      uint64
 	contractStats     map[common.Address]*ContractBloatStats
 	contractStatsLock sync.Mutex
+
+	// Gas optimization
+	currentTransfersPerTx uint64
+	blockGasLimit        uint64
 }
 
 var ScenarioName = "erc20-max-transfers"
@@ -140,8 +137,8 @@ var ScenarioDescriptor = scenario.Descriptor{
 func newScenario(logger logrus.FieldLogger) scenario.Scenario {
 	return &Scenario{
 		logger:        logger.WithField("scenario", ScenarioName),
-		usedAddresses: make(map[common.Address]bool),
 		contractStats: make(map[common.Address]*ContractBloatStats),
+		logChannel:    make(chan *LogEntry, 1000),
 	}
 }
 
@@ -174,7 +171,7 @@ func (s *Scenario) Init(options *scenario.Options) error {
 		return fmt.Errorf("failed to load transfer ABI: %w", err)
 	}
 
-	// We'll use the deployer wallet which we'll prepare in runMaxTransfersMode
+	// We only use the deployer wallet - no child wallets needed
 	s.walletPool.SetWalletCount(0)
 
 	return nil
@@ -245,9 +242,9 @@ func (s *Scenario) loadDeployedContracts() error {
 	return nil
 }
 
-// loadTransferABI loads the transfer function ABI from the contract
+// loadTransferABI loads the transfer and batchTransfer function ABIs from the contract
 func (s *Scenario) loadTransferABI() error {
-	// Parse the contract ABI to get the transfer method
+	// Parse the contract ABI to get the transfer methods
 	contractABI, err := abi.JSON(strings.NewReader(contract.ContractMetaData.ABI))
 	if err != nil {
 		return fmt.Errorf("failed to parse contract ABI: %w", err)
@@ -258,71 +255,293 @@ func (s *Scenario) loadTransferABI() error {
 		return fmt.Errorf("transfer method not found in contract ABI")
 	}
 
+	batchTransferMethod, exists := contractABI.Methods["batchTransfer"]
+	if !exists {
+		return fmt.Errorf("batchTransfer method not found in contract ABI")
+	}
+
 	s.transferABI = transferMethod
+	s.batchTransferABI = batchTransferMethod
 	s.contractABI = contractABI
 	return nil
 }
 
 // getNetworkBlockGasLimit retrieves the current block gas limit from the network
-// It waits for a new block to be mined (with timeout) to ensure fresh data
 func (s *Scenario) getNetworkBlockGasLimit(ctx context.Context, client *spamoor.Client) uint64 {
-	// Create a timeout context for the entire operation
-	timeoutCtx, cancel := context.WithTimeout(ctx, BlockMiningTimeout)
-	defer cancel()
-
-	// Get the current block number first
-	currentBlockNumber, err := client.GetEthClient().BlockNumber(timeoutCtx)
+	// Get the latest block
+	block, err := client.GetEthClient().BlockByNumber(ctx, nil)
 	if err != nil {
-		s.logger.Warnf("failed to get current block number: %v, using fallback: %d", err, FallbackBlockGasLimit)
+		s.logger.Warnf("failed to get latest block: %v, using fallback: %d", err, FallbackBlockGasLimit)
 		return FallbackBlockGasLimit
 	}
 
-	s.logger.Debugf("waiting for new block to be mined (current: %d, timeout: %v)", currentBlockNumber, BlockMiningTimeout)
-
-	// Wait for a new block to be mined
-	ticker := time.NewTicker(BlockPollingInterval)
-	defer ticker.Stop()
-
-	var latestBlock *types.Block
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			s.logger.Warnf("timeout waiting for new block to be mined, using fallback: %d", FallbackBlockGasLimit)
-			return FallbackBlockGasLimit
-		case <-ticker.C:
-			// Check for a new block
-			newBlockNumber, err := client.GetEthClient().BlockNumber(timeoutCtx)
-			if err != nil {
-				s.logger.Debugf("error checking block number: %v", err)
-				continue
-			}
-
-			// If we have a new block, get its details
-			if newBlockNumber > currentBlockNumber {
-				latestBlock, err = client.GetEthClient().BlockByNumber(timeoutCtx, nil)
-				if err != nil {
-					s.logger.Debugf("error getting latest block details: %v", err)
-					continue
-				}
-				s.logger.Debugf("new block mined: %d", newBlockNumber)
-				goto blockFound
-			}
-		}
-	}
-
-blockFound:
-	gasLimit := latestBlock.GasLimit()
-	s.logger.Debugf("network block gas limit from fresh block #%d: %d", latestBlock.NumberU64(), gasLimit)
+	gasLimit := block.GasLimit()
+	s.logger.Debugf("network block gas limit: %d", gasLimit)
 	return gasLimit
 }
 
-// generateRecipient generates a deterministic recipient address based on index
-func (s *Scenario) generateRecipient(recipientIndex uint64) common.Address {
-	idxBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(idxBytes, recipientIndex)
-	// Use deployer address as seed for deterministic generation
-	hash := sha256.Sum256(append(s.deployerAddress.Bytes(), idxBytes...))
-	return common.BytesToAddress(hash[12:]) // Use last 20 bytes as address
+// generateRandomRecipient generates a random recipient address
+func (s *Scenario) generateRandomRecipient() common.Address {
+	var addr common.Address
+	rand.Read(addr[:])
+	return addr
+}
+
+// selectNextContract selects the next contract in round-robin fashion
+func (s *Scenario) selectNextContract() common.Address {
+	if len(s.deployedContracts) == 0 {
+		return common.Address{}
+	}
+	
+	contract := s.deployedContracts[s.contractIndex]
+	s.contractIndex = (s.contractIndex + 1) % len(s.deployedContracts)
+	return contract
+}
+
+// calculateOptimalTransfers calculates the optimal number of transfers per transaction
+func (s *Scenario) calculateOptimalTransfers(blockGasLimit uint64) uint64 {
+	// Calculate target gas (95% of block limit)
+	targetGas := uint64(float64(blockGasLimit) * DefaultTargetGasRatio)
+	
+	// Calculate available gas for transfers
+	availableGas := targetGas - BaseTransactionGas - BatchFunctionOverhead
+	
+	// Calculate number of transfers that fit
+	transfers := availableGas / GasPerBatchTransfer
+	
+	// Apply reasonable bounds
+	if transfers < 1 {
+		transfers = 1
+	} else if transfers > 1000 { // Cap at 1000 transfers per tx for safety
+		transfers = 1000
+	}
+	
+	return transfers
+}
+
+// initializeDeployerWallet creates and initializes the deployer wallet
+func (s *Scenario) initializeDeployerWallet(ctx context.Context) error {
+	deployerWallet, err := spamoor.NewWallet(s.deployerPrivateKey)
+	if err != nil {
+		return fmt.Errorf("failed to create deployer wallet: %w", err)
+	}
+
+	// Update wallet with chain info
+	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, "")
+	if client == nil {
+		return fmt.Errorf("no client available")
+	}
+	
+	err = client.UpdateWallet(ctx, deployerWallet)
+	if err != nil {
+		return fmt.Errorf("failed to update deployer wallet: %w", err)
+	}
+
+	s.deployerWallet = deployerWallet
+	s.deployerAddress = deployerWallet.GetAddress()
+
+	s.logger.Infof("Initialized deployer wallet - Address: %s, Nonce: %d, Balance: %s ETH",
+		s.deployerAddress.Hex(), 
+		deployerWallet.GetNonce(), 
+		new(big.Int).Div(deployerWallet.GetBalance(), big.NewInt(1e18)).String())
+	
+	return nil
+}
+
+func (s *Scenario) Run(ctx context.Context) error {
+	s.logger.Infof("starting scenario: %s", ScenarioName)
+	defer s.logger.Infof("scenario %s finished.", ScenarioName)
+
+	// Initialize deployer wallet if needed
+	if s.deployerWallet == nil {
+		if err := s.initializeDeployerWallet(ctx); err != nil {
+			return err
+		}
+	}
+
+	// Start async logger
+	s.loggerWg.Add(1)
+	go s.asyncLogger(ctx)
+
+	defer func() {
+		close(s.logChannel)
+		s.loggerWg.Wait()
+	}()
+
+	// Get initial block gas limit
+	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, "")
+	if client == nil {
+		return fmt.Errorf("no client available")
+	}
+	
+	s.blockGasLimit = s.getNetworkBlockGasLimit(ctx, client)
+	// Calculate initial transfers per transaction
+	s.currentTransfersPerTx = s.calculateOptimalTransfers(s.blockGasLimit)
+	
+	s.logger.Infof("Block gas limit: %d, starting with %d transfers per tx", 
+		s.blockGasLimit, s.currentTransfersPerTx)
+
+	// Run transaction scenario
+	return scenario.RunTransactionScenario(ctx, scenario.TransactionScenarioOptions{
+		TotalCount: 0, // Run indefinitely
+		Throughput: 1, // One transaction per slot/block
+		MaxPending: 1, // Only one pending transaction at a time
+		WalletPool: s.walletPool,
+		Logger:     s.logger,
+		ProcessNextTxFn: s.processTransaction,
+	})
+}
+
+// processTransaction handles the creation and submission of a single transaction
+// containing multiple ERC20 transfers to maximize gas usage
+func (s *Scenario) processTransaction(ctx context.Context, txIdx uint64, onComplete func()) (func(), error) {
+	transactionSubmitted := false
+	defer func() {
+		if !transactionSubmitted {
+			onComplete()
+		}
+	}()
+
+	// Select next contract for this transaction
+	contractAddr := s.selectNextContract()
+	if contractAddr == (common.Address{}) {
+		return nil, fmt.Errorf("no contracts available")
+	}
+
+	client := s.walletPool.GetClient(spamoor.SelectClientRoundRobin, 0, "")
+	if client == nil {
+		return nil, fmt.Errorf("no client available")
+	}
+
+	// Check and update gas limit periodically
+	if txIdx%10 == 0 {
+		newGasLimit := s.getNetworkBlockGasLimit(ctx, client)
+		if newGasLimit != s.blockGasLimit {
+			s.blockGasLimit = newGasLimit
+			s.currentTransfersPerTx = s.calculateOptimalTransfers(newGasLimit)
+			s.logger.Infof("Block gas limit changed: %d, adjusting transfers to %d",
+				newGasLimit, s.currentTransfersPerTx)
+		}
+	}
+
+	// Build transaction with multiple transfers
+	tx, recipients, err := s.buildMultiTransferTransaction(ctx, contractAddr, client)
+	if err != nil {
+		return nil, err
+	}
+
+	transactionSubmitted = true
+	err = s.walletPool.GetTxPool().SendTransaction(ctx, s.deployerWallet, tx, &spamoor.SendTransactionOptions{
+		Client:      client,
+		Rebroadcast: true,
+		OnComplete: func(tx *types.Transaction, receipt *types.Receipt, err error) {
+			onComplete()
+		},
+		OnConfirm: func(tx *types.Transaction, receipt *types.Receipt) {
+			if receipt != nil && receipt.Status == types.ReceiptStatusSuccessful {
+				// Send log entry for async processing
+				s.logChannel <- &LogEntry{
+					Contract:    contractAddr,
+					Recipients:  recipients,
+					GasUsed:     receipt.GasUsed,
+					BlockNumber: receipt.BlockNumber.Uint64(),
+					TxHash:      tx.Hash(),
+					Timestamp:   time.Now(),
+				}
+				
+				// Update metrics
+				atomic.AddUint64(&s.totalRecipients, uint64(len(recipients)))
+				atomic.AddUint64(&s.totalGasUsed, receipt.GasUsed)
+				
+				// Update contract stats
+				s.updateContractStats(contractAddr, len(recipients))
+			}
+		},
+	})
+
+	if err != nil {
+		s.deployerWallet.ResetPendingNonce(ctx, client)
+	}
+
+	// Return logging function
+	return func() {
+		if err != nil {
+			s.logger.Warnf("could not send transaction: %v", err)
+		} else {
+			s.logger.Infof("sent tx #%d: %v (transfers: %d)", txIdx+1, tx.Hash().String(), len(recipients))
+		}
+	}, err
+}
+
+// buildMultiTransferTransaction creates a transaction containing multiple transfers
+func (s *Scenario) buildMultiTransferTransaction(ctx context.Context, contractAddr common.Address, client *spamoor.Client) (*types.Transaction, []common.Address, error) {
+	// Get suggested fees
+	feeCap, tipCap, err := s.walletPool.GetTxPool().GetSuggestedFees(client, s.options.BaseFee, s.options.TipFee)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Generate recipients
+	recipients := make([]common.Address, s.currentTransfersPerTx)
+	for i := range recipients {
+		recipients[i] = s.generateRandomRecipient()
+	}
+
+	// Build transaction with batch transfer call data
+	callData, err := s.encodeMultipleTransfers(recipients)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Calculate gas needed for batch transfer
+	gasLimit := uint64(BaseTransactionGas + BatchFunctionOverhead + (GasPerBatchTransfer * uint64(len(recipients))))
+
+	// Build transaction using BuildBoundTx
+	tx, err := s.deployerWallet.BuildBoundTx(ctx, &txbuilder.TxMetadata{
+		GasFeeCap: uint256.MustFromBig(feeCap),
+		GasTipCap: uint256.MustFromBig(tipCap),
+		Gas:       gasLimit,
+		To:        &contractAddr,
+		Value:     uint256.NewInt(0),
+		Data:      callData,
+	}, func(transactOpts *bind.TransactOpts) (*types.Transaction, error) {
+		// For raw data transactions, we just return a transaction with the data
+		// The BuildBoundTx will handle nonce, gas prices, and signing
+		return types.NewTx(&types.DynamicFeeTx{
+			To:    &contractAddr,
+			Data:  callData,
+			Gas:   gasLimit,
+			Value: big.NewInt(0),
+		}), nil
+	})
+
+	return tx, recipients, err
+}
+
+// encodeMultipleTransfers encodes a batch transfer call
+func (s *Scenario) encodeMultipleTransfers(recipients []common.Address) ([]byte, error) {
+	if len(recipients) == 0 {
+		return nil, fmt.Errorf("no recipients")
+	}
+	
+	// Pack batch transfer call with all recipients
+	// Note: The contract's batchTransfer function uses a fixed amount of 1 token per recipient
+	return s.contractABI.Pack("batchTransfer", recipients)
+}
+
+// updateContractStats updates the statistics for a contract when transfers are confirmed
+func (s *Scenario) updateContractStats(contractAddr common.Address, recipientCount int) {
+	s.contractStatsLock.Lock()
+	defer s.contractStatsLock.Unlock()
+
+	stats, exists := s.contractStats[contractAddr]
+	if !exists {
+		stats = &ContractBloatStats{
+			UniqueRecipients: 0,
+		}
+		s.contractStats[contractAddr] = stats
+	}
+	stats.UniqueRecipients += recipientCount
 }
 
 // loadBloatingSummary loads the bloating summary from file or creates a new one
@@ -366,21 +585,6 @@ func (s *Scenario) saveBloatingSummary(summary *BloatingSummary) error {
 	return nil
 }
 
-// updateContractStats updates the statistics for a contract when a transfer is confirmed
-func (s *Scenario) updateContractStats(contractAddr common.Address) {
-	s.contractStatsLock.Lock()
-	defer s.contractStatsLock.Unlock()
-
-	stats, exists := s.contractStats[contractAddr]
-	if !exists {
-		stats = &ContractBloatStats{
-			UniqueRecipients: 0,
-		}
-		s.contractStats[contractAddr] = stats
-	}
-	stats.UniqueRecipients++
-}
-
 // updateAndSaveBloatingSummary updates the bloating summary with current stats and saves to file
 func (s *Scenario) updateAndSaveBloatingSummary(blockNumber string) error {
 	// Load existing summary
@@ -410,420 +614,79 @@ func (s *Scenario) updateAndSaveBloatingSummary(blockNumber string) error {
 	return s.saveBloatingSummary(summary)
 }
 
-// getContractBloatingSummaryForBlock returns a formatted string with contract bloating info for latest block
-func (s *Scenario) getContractBloatingSummaryForBlock() string {
-	s.contractStatsLock.Lock()
-	defer s.contractStatsLock.Unlock()
+// asyncLogger handles asynchronous logging of transfer metrics
+func (s *Scenario) asyncLogger(ctx context.Context) {
+	defer s.loggerWg.Done()
 
-	// Get current round contract
-	s.contractsLock.Lock()
-	currentContract := s.currentRoundContract
-	s.contractsLock.Unlock()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 
-	if currentContract == (common.Address{}) {
-		return "No contract selected for current round"
-	}
-
-	// Get stats for current contract
-	stats, exists := s.contractStats[currentContract]
-	if !exists {
-		return fmt.Sprintf("CONTRACT BLOATING STATUS:\n  Round Contract: %s - No transfers yet", currentContract.Hex())
-	}
-
-	return fmt.Sprintf("CONTRACT BLOATING STATUS:\n  Round Contract: %s - %d unique recipients",
-		currentContract.Hex(), stats.UniqueRecipients)
-}
-
-// selectRandomContract randomly selects a contract from the deployed contracts
-func (s *Scenario) selectRandomContract() (common.Address, error) {
-	s.contractsLock.Lock()
-	defer s.contractsLock.Unlock()
-
-	if len(s.deployedContracts) == 0 {
-		return common.Address{}, fmt.Errorf("no deployed contracts available")
-	}
-
-	// If only one contract, return it
-	if len(s.deployedContracts) == 1 {
-		return s.deployedContracts[0], nil
-	}
-
-	// Generate random index
-	max := big.NewInt(int64(len(s.deployedContracts)))
-	n, err := rand.Int(rand.Reader, max)
-	if err != nil {
-		return common.Address{}, fmt.Errorf("failed to generate random number: %w", err)
-	}
-
-	return s.deployedContracts[n.Int64()], nil
-}
-
-func (s *Scenario) Run(ctx context.Context) error {
-	return s.runMaxTransfersMode(ctx)
-}
-
-func (s *Scenario) runMaxTransfersMode(ctx context.Context) error {
-	s.logger.Infof("starting max transfers mode: self-adjusting to target block gas limit, continuous operation")
-
-	// Get a client for network operations
-	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, "")
-
-	// Get the actual network block gas limit
-	networkGasLimit := s.getNetworkBlockGasLimit(ctx, client)
-	targetGas := uint64(float64(networkGasLimit) * DefaultTargetGasRatio)
-
-	// Calculate initial transfer count based on network gas limit and known gas cost per transfer
-	initialTransfers := int(targetGas / ERC20TransferGasCost)
-
-	// Dynamic transfer count - starts based on network parameters and adjusts based on actual performance
-	currentTransfers := initialTransfers
-
-	// Prepare the deployer wallet if not already done
-	if s.deployerWallet == nil {
-		// Create wallet from deployer private key
-		deployerWallet, err := spamoor.NewWallet(s.deployerPrivateKey)
-		if err != nil {
-			return fmt.Errorf("failed to create deployer wallet: %w", err)
-		}
-
-		// Update wallet with chain info using the client
-		err = client.UpdateWallet(ctx, deployerWallet)
-		if err != nil {
-			return fmt.Errorf("failed to update deployer wallet: %w", err)
-		}
-
-		// Store the wallet instance
-		s.deployerWallet = deployerWallet
-		s.deployerAddress = deployerWallet.GetAddress()
-
-		s.logger.Infof("Initialized deployer wallet - Address: %s, Nonce: %d, Balance: %s ETH",
-			s.deployerAddress.Hex(), deployerWallet.GetNonce(), new(big.Int).Div(deployerWallet.GetBalance(), big.NewInt(1e18)).String())
-	}
-
-	var blockCounter int
-	var totalTransfers uint64
-	var totalUniqueRecipients uint64
+	logs := make([]*LogEntry, 0, 100)
+	var lastBlockNumber uint64
 
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Errorf("max transfers mode stopping due to context cancellation")
-			return ctx.Err()
-		default:
-		}
-
-		blockCounter++
-
-		// Send the max transfer transactions and wait for confirmation
-		s.logger.Infof("════════════════ TRANSFER PHASE #%d ════════════════", blockCounter)
-		actualGasUsed, blockNumber, transferCount, gasPerTransfer, uniqueRecipients, err := s.sendMaxTransfers(ctx, s.deployerWallet, currentTransfers, targetGas, blockCounter, client)
-		if err != nil {
-			s.logger.Errorf("failed to send max transfers for iteration %d: %v", blockCounter, err)
-			time.Sleep(RetryDelay) // Wait before retry
-			continue
-		}
-
-		// Update totals
-		totalTransfers += uint64(transferCount)
-		totalUniqueRecipients += uint64(uniqueRecipients)
-
-		s.logger.Infof("%%%%%%%%%%%%%%%%%%%% ANALYSIS PHASE #%d %%%%%%%%%%%%%%%%%%%%", blockCounter)
-
-		// Calculate metrics
-		blockGasLimit := float64(networkGasLimit)
-		gasUtilization := (float64(actualGasUsed) / blockGasLimit) * 100
-		estimatedStateGrowth := uniqueRecipients * EstimatedStateGrowthPerTransfer
-
-		s.logger.WithField("scenario", ScenarioName).Infof("TRANSFER METRICS - Block #%s | Transfers: %d | Unique recipients: %d | Gas used: %.2fM | Block utilization: %.2f%% | Gas/transfer: %.1f | Est. state growth: %.2f KiB",
-			blockNumber, transferCount, uniqueRecipients, float64(actualGasUsed)/GasPerMillion, gasUtilization, gasPerTransfer, float64(estimatedStateGrowth)/BytesPerKiB)
-
-		// Log contract-specific bloating info
-		s.logger.WithField("scenario", ScenarioName).Info(s.getContractBloatingSummaryForBlock())
-
-		// Log cumulative metrics
-		s.logger.WithField("scenario", ScenarioName).Infof("CUMULATIVE TOTALS - Total transfers: %d | Total unique recipients: %d | Avg transfers/block: %.1f",
-			totalTransfers, totalUniqueRecipients, float64(totalTransfers)/float64(blockCounter))
-
-		// Update and save bloating summary
-		err = s.updateAndSaveBloatingSummary(blockNumber)
-		if err != nil {
-			s.logger.Warnf("Failed to update bloating summary: %v", err)
-		}
-
-		// Self-adjust transfer count based on actual performance
-		if actualGasUsed > 0 && transferCount > 0 {
-			avgGasPerTransfer := float64(actualGasUsed) / float64(transferCount)
-			targetTransfers := int(float64(targetGas) / avgGasPerTransfer)
-
-			// Calculate the adjustment needed
-			transferDifference := targetTransfers - transferCount
-
-			if actualGasUsed < targetGas {
-				// We're under target, increase transfer count with a slight safety margin
-				newTransfers := currentTransfers + transferDifference - 1
-
-				if newTransfers > currentTransfers {
-					s.logger.Infof("Adjusting transfers: %d → %d (need %d more for target)",
-						currentTransfers, newTransfers, transferDifference)
-					currentTransfers = newTransfers
-				}
-			} else if actualGasUsed > targetGas {
-				// We're over target, reduce to reach max block utilization
-				excess := actualGasUsed - targetGas
-				excessTransfers := int(float64(excess) / avgGasPerTransfer)
-				newTransfers := currentTransfers - excessTransfers
-
-				s.logger.Infof("Reducing transfers: %d → %d (excess: %d gas, ~%d transfers)",
-					currentTransfers, newTransfers, excess, excessTransfers)
-				currentTransfers = newTransfers
-
-			} else {
-				s.logger.Infof("Target achieved! Gas Used: %d / Target: %d", actualGasUsed, targetGas)
+			s.flushLogs(logs)
+			return
+		case log := <-s.logChannel:
+			if log == nil {
+				s.flushLogs(logs)
+				return
 			}
+			logs = append(logs, log)
+			if log.BlockNumber > lastBlockNumber {
+				lastBlockNumber = log.BlockNumber
+			}
+		case <-ticker.C:
+			s.flushLogs(logs)
+			// Update bloating summary
+			if lastBlockNumber > 0 {
+				if err := s.updateAndSaveBloatingSummary(fmt.Sprintf("%d", lastBlockNumber)); err != nil {
+					s.logger.Warnf("Failed to update bloating summary: %v", err)
+				}
+			}
+			logs = logs[:0]
 		}
 	}
 }
 
-func (s *Scenario) sendMaxTransfers(ctx context.Context, deployerWallet *spamoor.Wallet, targetTransfers int, targetGasLimit uint64, blockCounter int, client *spamoor.Client) (uint64, string, int, float64, int, error) {
-	// Select a random contract for this round
-	contractForRound, err := s.selectRandomContract()
-	if err != nil {
-		return 0, "", 0, 0, 0, fmt.Errorf("failed to select contract for round: %w", err)
+// flushLogs processes and logs accumulated transfer data
+func (s *Scenario) flushLogs(logs []*LogEntry) {
+	if len(logs) == 0 {
+		return
 	}
 
-	// Update current round contract
-	s.contractsLock.Lock()
-	s.currentRoundContract = contractForRound
-	s.contractsLock.Unlock()
-
-	s.logger.Infof("Selected contract for round #%d: %s", blockCounter, contractForRound.Hex())
-
-	// Get suggested fees or use configured values
-	var feeCap *big.Int
-	var tipCap *big.Int
-
-	if s.options.BaseFee > 0 {
-		feeCap = new(big.Int).Mul(big.NewInt(int64(s.options.BaseFee)), big.NewInt(GweiPerEth))
-	}
-	if s.options.TipFee > 0 {
-		tipCap = new(big.Int).Mul(big.NewInt(int64(s.options.TipFee)), big.NewInt(GweiPerEth))
-	}
-
-	if feeCap == nil || tipCap == nil {
-		var err error
-		feeCap, tipCap, err = client.GetSuggestedFee(s.walletPool.GetContext())
-		if err != nil {
-			return 0, "", 0, 0, 0, fmt.Errorf("failed to get suggested fees: %w", err)
-		}
-	}
-
-	// Ensure minimum gas prices for inclusion
-	minFeeCap := new(big.Int).Mul(big.NewInt(int64(s.options.BaseFee)), big.NewInt(GweiPerEth))
-	minTipCap := new(big.Int).Mul(big.NewInt(int64(s.options.TipFee)), big.NewInt(GweiPerEth))
-
-	if feeCap.Cmp(minFeeCap) < 0 {
-		feeCap = minFeeCap
-	}
-	if tipCap.Cmp(minTipCap) < 0 {
-		tipCap = minTipCap
-	}
-
-	// Send transfers in batches
-	return s.sendTransferBatch(ctx, deployerWallet, targetTransfers, targetGasLimit, blockCounter, client, feeCap, tipCap)
-}
-
-func (s *Scenario) sendTransferBatch(ctx context.Context, wallet *spamoor.Wallet, targetTransfers int, targetGasLimit uint64, iteration int, client *spamoor.Client, feeCap, tipCap *big.Int) (uint64, string, int, float64, int, error) {
-	var confirmedCount int64
-	var uniqueRecipientsCount int64
+	// Calculate totals
+	var totalTransfers int
 	var totalGasUsed uint64
-	var lastBlockNumber string
+	contractTransfers := make(map[common.Address]int)
 
-	sentCount := 0
-	recipientIndex := uint64(iteration * 1000000) // Large offset per iteration to avoid conflicts
-
-	// Calculate approximate transactions per block based on gas limit
-	maxTxsPerBlock := int(targetGasLimit / ERC20TransferGasCost)
-
-	// Track confirmations
-	type confirmResult struct {
-		gasUsed      uint64
-		blockNumber  string
-		recipient    common.Address
-		contractUsed common.Address
-	}
-	// Make channel buffered with enough capacity for all transactions
-	confirmChan := make(chan confirmResult, targetTransfers*2) // Double buffer to be safe
-
-	// Send transactions
-	for sentCount < targetTransfers {
-		// Generate unique recipient address
-		var recipient common.Address
-		for {
-			recipient = s.generateRecipient(recipientIndex)
-			recipientIndex++
-
-			// Check if address already used
-			s.usedAddressesLock.Lock()
-			if !s.usedAddresses[recipient] {
-				s.usedAddresses[recipient] = true
-				s.usedAddressesLock.Unlock()
-				break
-			}
-			s.usedAddressesLock.Unlock()
-		}
-
-		// Use the contract selected for this round
-		s.contractsLock.Lock()
-		contractAddr := s.currentRoundContract
-		s.contractsLock.Unlock()
-
-		// Encode transfer call data
-		transferAmount := big.NewInt(TokenTransferAmount)
-		callData, err := s.contractABI.Pack("transfer", recipient, transferAmount)
-		if err != nil {
-			s.logger.Errorf("failed to pack transfer call data: %v", err)
-			continue
-		}
-
-		// Build transaction
-		txMetadata := &txbuilder.TxMetadata{
-			GasFeeCap: uint256.MustFromBig(feeCap),
-			GasTipCap: uint256.MustFromBig(tipCap),
-			Gas:       ERC20TransferGasCost,
-			To:        &contractAddr,
-			Value:     uint256.NewInt(0), // No ETH value for ERC20 transfer
-			Data:      callData,
-		}
-
-		txData, err := txbuilder.DynFeeTx(txMetadata)
-		if err != nil {
-			s.logger.Errorf("failed to create tx data: %v", err)
-			continue
-		}
-
-		tx, err := wallet.BuildDynamicFeeTx(txData)
-		if err != nil {
-			s.logger.Errorf("failed to build transaction: %v", err)
-			continue
-		}
-
-		// Capture values for closure
-		capturedRecipient := recipient
-		capturedContract := contractAddr
-
-		// Send transaction
-		err = s.walletPool.GetTxPool().SendTransaction(ctx, wallet, tx, &spamoor.SendTransactionOptions{
-			Client:      client,
-			Rebroadcast: false, // No retries to avoid duplicates
-			OnComplete: func(tx *types.Transaction, receipt *types.Receipt, err error) {
-				if err != nil {
-					return // Don't log individual failures
-				}
-				if receipt != nil && receipt.Status == 1 {
-					atomic.AddInt64(&confirmedCount, 1)
-					atomic.AddInt64(&uniqueRecipientsCount, 1)
-
-					// Update contract stats
-					s.updateContractStats(capturedContract)
-
-					// Send result to channel with captured values
-					confirmChan <- confirmResult{
-						gasUsed:      receipt.GasUsed,
-						blockNumber:  receipt.BlockNumber.String(),
-						recipient:    capturedRecipient,
-						contractUsed: capturedContract,
-					}
-				}
-			},
-			LogFn: func(client *spamoor.Client, retry int, rebroadcast int, err error) {
-				// Only log actual send failures
-				if err != nil {
-					s.logger.Debugf("transfer tx send failed: %v", err)
-				}
-			},
-		})
-
-		if err != nil {
-			continue
-		}
-
-		sentCount++
-
-		// Small delay between transactions to ensure proper nonce ordering
-		if sentCount < TransactionBatchSize {
-			time.Sleep(InitialTransactionDelay)
-		} else if sentCount%maxTxsPerBlock < TransactionBatchThreshold {
-			time.Sleep(OptimizedTransactionDelay)
-		}
-
-		// Add context cancellation check
-		select {
-		case <-ctx.Done():
-			return 0, "", 0, 0, 0, ctx.Err()
-		default:
-		}
+	for _, log := range logs {
+		totalTransfers += len(log.Recipients)
+		totalGasUsed += log.GasUsed
+		contractTransfers[log.Contract] += len(log.Recipients)
 	}
 
-	// Wait for confirmations
-	s.logger.Infof("Sent %d transfer transactions, waiting for confirmations...", sentCount)
-	time.Sleep(ConfirmationDelay)
+	// Get current metrics
+	currentRecipients := atomic.LoadUint64(&s.totalRecipients)
+	currentGasUsed := atomic.LoadUint64(&s.totalGasUsed)
+	avgGasPerTransfer := float64(totalGasUsed) / float64(totalTransfers)
 
-	// Log initial confirmation status
-	initialConfirmed := atomic.LoadInt64(&confirmedCount)
-	if initialConfirmed > 0 {
-		s.logger.Debugf("Already have %d confirmations before collection", initialConfirmed)
+	s.logger.WithFields(logrus.Fields{
+		"transactions":      len(logs),
+		"totalTransfers":    totalTransfers,
+		"totalGasUsed":      totalGasUsed,
+		"avgGasPerTransfer": fmt.Sprintf("%.1f", avgGasPerTransfer),
+		"totalRecipients":   currentRecipients,
+		"cumulativeGas":     currentGasUsed,
+	}).Info("ERC20 transfer batch completed")
+
+	// Log per-contract stats
+	for contract, transfers := range contractTransfers {
+		s.logger.WithFields(logrus.Fields{
+			"contract":  contract.Hex(),
+			"transfers": transfers,
+		}).Debug("Contract transfer stats")
 	}
-
-	// Collect results - wait for all sent transactions or timeout
-	confirmTimeout := time.After(30 * time.Second)
-	resultCount := 0
-
-collectResults:
-	for resultCount < sentCount {
-		select {
-		case result := <-confirmChan:
-			totalGasUsed += result.gasUsed
-			lastBlockNumber = result.blockNumber
-			resultCount++
-
-		case <-confirmTimeout:
-			// Final check for any remaining confirmations
-			confirmed := atomic.LoadInt64(&confirmedCount)
-			s.logger.Warnf("Timeout waiting for confirmations, received %d results, %d confirmed, %d sent", resultCount, confirmed, sentCount)
-			break collectResults
-
-		case <-ctx.Done():
-			return 0, "", 0, 0, 0, ctx.Err()
-		}
-	}
-
-	// Drain any remaining results from the channel (non-blocking)
-	for {
-		select {
-		case result := <-confirmChan:
-			totalGasUsed += result.gasUsed
-			lastBlockNumber = result.blockNumber
-			resultCount++
-		default:
-			// No more results available
-			goto done
-		}
-	}
-done:
-
-	// Calculate metrics
-	confirmed := atomic.LoadInt64(&confirmedCount)
-	uniqueRecipients := atomic.LoadInt64(&uniqueRecipientsCount)
-
-	// Log detailed confirmation statistics
-	s.logger.Debugf("Confirmation stats: sent=%d, confirmed=%d, results=%d, gas=%d",
-		sentCount, confirmed, resultCount, totalGasUsed)
-
-	if confirmed == 0 {
-		return 0, "", 0, 0, 0, fmt.Errorf("no transfers confirmed")
-	}
-
-	gasPerTransfer := float64(totalGasUsed) / float64(confirmed)
-
-	return totalGasUsed, lastBlockNumber, int(confirmed), gasPerTransfer, int(uniqueRecipients), nil
 }

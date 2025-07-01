@@ -41,6 +41,21 @@ contract StateBloatToken {
         return true;
     }
 
+    // Optimized batch transfer for maximum gas efficiency
+    function batchTransfer(address[] calldata recipients) public {
+        uint256 amount = 1; // Fixed 1 token per transfer
+        uint256 senderBalance = balanceOf[msg.sender];
+        
+        unchecked {
+            for (uint256 i = 0; i < recipients.length; i++) {
+                senderBalance -= amount;
+                balanceOf[recipients[i]] += amount;
+            }
+        }
+        
+        balanceOf[msg.sender] = senderBalance;
+    }
+
     function approve(address spender, uint256 value) public returns (bool) {
         allowance[msg.sender][spender] = value;
         emit Approval(msg.sender, spender, value);
@@ -298,46 +313,7 @@ contract StateBloatToken {
         return 59;
     }
 
-    function dummy60() public pure returns (uint256) {
-        return 60;
-    }
 
-    function dummy61() public pure returns (uint256) {
-        return 61;
-    }
-
-    function dummy62() public pure returns (uint256) {
-        return 62;
-    }
-
-    function dummy63() public pure returns (uint256) {
-        return 63;
-    }
-
-    function dummy64() public pure returns (uint256) {
-        return 64;
-    }
-
-    function dummy65() public pure returns (uint256) {
-        return 65;
-    }
-
-    // Additional dummy functions to increase bytecode to exactly 24KiB
-    function dummy66() public pure returns (uint256) {
-        return 66;
-    }
-
-    function dummy67() public pure returns (uint256) {
-        return 67;
-    }
-
-    function dummy68() public pure returns (uint256) {
-        return 68;
-    }
-
-    function dummy69() public pure returns (uint256) {
-        return 69;
-    }
 
     function transferFrom1(
         address from,

@@ -4,23 +4,25 @@ This scenario maximizes the number of ERC20 token transfers per block to unique 
 
 ## Overview
 
-The scenario uses deployed StateBloatToken contracts from `deployments.json` to send the maximum possible number of ERC20 transfers per block. Each transfer sends 1 token to a unique, never-before-used address, maximizing state growth.
+The scenario uses deployed StateBloatToken contracts from `deployments.json` to send ERC20 transfers. Each transfer sends 1 token to a unique, never-before-used address, creating state growth.
+
+**Updated**: The StateBloatToken contract now includes an optimized `batchTransfer` function that allows sending tokens to multiple recipients in a single transaction, maximizing gas usage per block.
 
 ## Features
 
-- **Dynamic Block Gas Limit**: Fetches the actual network block gas limit before starting
-- **Self-Adjusting Transfer Count**: Automatically adjusts the number of transfers based on actual gas usage
-- **Unique Recipients**: Generates deterministic unique addresses for each transfer
-- **Minimum Gas Fees**: Uses configured minimum gas fees (default: 10 gwei base, 5 gwei tip)
+- **Single Deployer Wallet**: Uses only the deployer wallet which holds all tokens
+- **Unique Recipients**: Generates random unique addresses for each transfer
+- **Configurable Gas Fees**: Uses configured gas fees (default: 10 gwei base, 2 gwei tip)
 - **Round-Robin Contract Usage**: Distributes transfers across multiple deployed contracts
-- **Recipient Tracking**: Saves all recipient addresses to `recipients.json` for analysis
+- **Async Logging**: Separates logging from transaction sending for better performance
+- **Bloating Summary Tracking**: Saves state growth metrics to `erc20_bloating_summary.json`
 
 ## Configuration
 
 ### Command Line Flags
 
 - `--basefee`: Max fee per gas in gwei (default: 10)
-- `--tipfee`: Max tip per gas in gwei (default: 5)
+- `--tipfee`: Max tip per gas in gwei (default: 2)
 - `--contract`: Specific contract address to use (default: rotate through all)
 
 ## How It Works
@@ -28,24 +30,24 @@ The scenario uses deployed StateBloatToken contracts from `deployments.json` to 
 1. **Initialization**:
    - Loads deployed contracts and private key from `deployments.json`
    - Sets up the deployer wallet (which holds all tokens)
-   - Fetches network block gas limit
+   - Uses spamoor's RunTransactionScenario for transaction management
 
 2. **Transfer Phase**:
-   - Calculates optimal transfer count based on gas limit
-   - Generates unique recipient addresses deterministically
-   - Sends transfers in batches with minimal delays
+   - Sends multiple transfers per transaction using batch transfer
+   - Dynamically calculates optimal batch size based on block gas limit
+   - Generates random unique recipient addresses
    - Uses round-robin contract selection
+   - Leverages spamoor's built-in nonce handling and transaction rebroadcasting
 
-3. **Analysis Phase**:
-   - Tracks confirmed transfers and gas usage
-   - Calculates actual gas per transfer
-   - Adjusts transfer count for next iteration
-   - Saves recipient data to file
+3. **Logging & Tracking**:
+   - Async logging of confirmed transfers
+   - Updates contract statistics for unique recipients
+   - Periodically saves bloating summary to JSON file
 
-4. **Self-Adjustment**:
-   - If under target gas usage: increases transfers
-   - If over target gas usage: decreases transfers
-   - Aims for 99.5% block utilization
+4. **Transaction Management**:
+   - Uses BuildBoundTx pattern for proper nonce handling
+   - Automatic transaction rebroadcasting on failure
+   - One transaction per block (throughput: 1)
 
 ## State Growth Impact
 
@@ -56,10 +58,10 @@ Each successful transfer creates:
 
 ## Output
 
-Recipient addresses are saved to `recipients.json` with:
-- Address
-- Block number
-- Tokens sent
+State bloat metrics are saved to `erc20_bloating_summary.json` with:
+- Per-contract unique recipient counts
+- Total recipients across all contracts
+- Last block number and timestamp
 
 ## Requirements
 
