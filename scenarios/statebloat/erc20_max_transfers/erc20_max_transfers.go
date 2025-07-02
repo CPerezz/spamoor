@@ -94,13 +94,13 @@ type Scenario struct {
 	logger     *logrus.Entry
 	walletPool *spamoor.WalletPool
 
-	// Deployed contracts and deployer wallet
-	deployerPrivateKey string
-	deployerAddress    common.Address
-	deployerWallet     *spamoor.Wallet
-	deployedContracts  []common.Address
+	// Deployed contracts and deployer wallets
+	deployerWallets    []*spamoor.Wallet
+	deployedContracts  map[string][]common.Address // Private key -> contracts
 	contractInstances  map[common.Address]*contract.Contract
 	contractIndex      int // Round-robin index
+	deployerIndex      int // Round-robin index for deployer wallets
+	allContracts       []common.Address // Flattened list for round-robin
 
 	// Contract ABI
 	transferABI      abi.Method
@@ -137,10 +137,13 @@ var ScenarioDescriptor = scenario.Descriptor{
 
 func newScenario(logger logrus.FieldLogger) scenario.Scenario {
 	return &Scenario{
-		logger:            logger.WithField("scenario", ScenarioName),
-		contractStats:     make(map[common.Address]*ContractBloatStats),
-		contractInstances: make(map[common.Address]*contract.Contract),
-		logChannel:        make(chan *LogEntry, 1000),
+		logger:             logger.WithField("scenario", ScenarioName),
+		contractStats:      make(map[common.Address]*ContractBloatStats),
+		contractInstances:  make(map[common.Address]*contract.Contract),
+		deployedContracts:  make(map[string][]common.Address),
+		deployerWallets:    make([]*spamoor.Wallet, 0),
+		allContracts:       make([]common.Address, 0),
+		logChannel:         make(chan *LogEntry, 1000),
 	}
 }
 
@@ -184,41 +187,55 @@ func (s *Scenario) Config() string {
 	return string(yamlBytes)
 }
 
-// loadDeployedContracts loads contract addresses and private key from deployments.json
+// loadDeployedContracts loads contract addresses and creates deployer wallets from deployments.json
 func (s *Scenario) loadDeployedContracts() error {
 	data, err := os.ReadFile("deployments.json")
 	if err != nil {
 		return fmt.Errorf("failed to read deployments.json: %w", err)
 	}
 
-	var deployments DeploymentEntry
+	var deployments map[string][]string
 	err = json.Unmarshal(data, &deployments)
 	if err != nil {
 		return fmt.Errorf("failed to parse deployments.json: %w", err)
 	}
 
-	// Get the first (and only) entry
+	// Process all entries and create wallets
+	totalContracts := 0
 	for privateKey, addresses := range deployments {
 		// Trim 0x prefix if present
 		if strings.HasPrefix(privateKey, "0x") {
 			privateKey = privateKey[2:]
 		}
-		s.deployerPrivateKey = privateKey
-		s.deployedContracts = make([]common.Address, len(addresses))
-		for i, addr := range addresses {
-			s.deployedContracts[i] = common.HexToAddress(addr)
+
+		// Create wallet from private key
+		wallet, err := spamoor.NewWallet(privateKey)
+		if err != nil {
+			s.logger.Warnf("Failed to create wallet from private key: %v", err)
+			continue
 		}
-		break // Only process the first entry
+
+		s.deployerWallets = append(s.deployerWallets, wallet)
+		
+		// Store contract addresses
+		contractAddrs := make([]common.Address, len(addresses))
+		for i, addr := range addresses {
+			contractAddrs[i] = common.HexToAddress(addr)
+			s.allContracts = append(s.allContracts, contractAddrs[i])
+		}
+		s.deployedContracts[privateKey] = contractAddrs
+		totalContracts += len(addresses)
 	}
 
-	if s.deployerPrivateKey == "" || len(s.deployedContracts) == 0 {
+	if len(s.deployerWallets) == 0 || totalContracts == 0 {
 		return fmt.Errorf("no valid deployments found in deployments.json")
 	}
 
-	s.logger.Infof("Loaded %d deployed contracts from deployments.json", len(s.deployedContracts))
+	s.logger.Infof("Loaded %d deployer wallets with %d total contracts from deployments.json", 
+		len(s.deployerWallets), totalContracts)
 
 	// Initialize contract stats for all deployed contracts
-	for _, contractAddr := range s.deployedContracts {
+	for _, contractAddr := range s.allContracts {
 		s.contractStats[contractAddr] = &ContractBloatStats{
 			UniqueRecipients: 0,
 		}
@@ -228,10 +245,10 @@ func (s *Scenario) loadDeployedContracts() error {
 	if s.options.Contract != "" {
 		contractAddr := common.HexToAddress(s.options.Contract)
 		found := false
-		for _, addr := range s.deployedContracts {
+		for _, addr := range s.allContracts {
 			if addr == contractAddr {
 				found = true
-				s.deployedContracts = []common.Address{contractAddr} // Use only this contract
+				s.allContracts = []common.Address{contractAddr} // Use only this contract
 				break
 			}
 		}
@@ -291,13 +308,24 @@ func (s *Scenario) generateRandomRecipient() common.Address {
 
 // selectNextContract selects the next contract in round-robin fashion
 func (s *Scenario) selectNextContract() common.Address {
-	if len(s.deployedContracts) == 0 {
+	if len(s.allContracts) == 0 {
 		return common.Address{}
 	}
 	
-	contract := s.deployedContracts[s.contractIndex]
-	s.contractIndex = (s.contractIndex + 1) % len(s.deployedContracts)
+	contract := s.allContracts[s.contractIndex]
+	s.contractIndex = (s.contractIndex + 1) % len(s.allContracts)
 	return contract
+}
+
+// selectNextDeployerWallet selects the next deployer wallet in round-robin fashion
+func (s *Scenario) selectNextDeployerWallet() *spamoor.Wallet {
+	if len(s.deployerWallets) == 0 {
+		return nil
+	}
+	
+	wallet := s.deployerWallets[s.deployerIndex]
+	s.deployerIndex = (s.deployerIndex + 1) % len(s.deployerWallets)
+	return wallet
 }
 
 // calculateOptimalTransfers calculates the optimal number of transfers per transaction
@@ -321,31 +349,26 @@ func (s *Scenario) calculateOptimalTransfers(blockGasLimit uint64) uint64 {
 	return transfers
 }
 
-// initializeDeployerWallet creates and initializes the deployer wallet
-func (s *Scenario) initializeDeployerWallet(ctx context.Context) error {
-	deployerWallet, err := spamoor.NewWallet(s.deployerPrivateKey)
-	if err != nil {
-		return fmt.Errorf("failed to create deployer wallet: %w", err)
-	}
-
-	// Update wallet with chain info
+// initializeDeployerWallets updates all deployer wallets with chain info
+func (s *Scenario) initializeDeployerWallets(ctx context.Context) error {
 	client := s.walletPool.GetClient(spamoor.SelectClientByIndex, 0, "")
 	if client == nil {
 		return fmt.Errorf("no client available")
 	}
 	
-	err = client.UpdateWallet(ctx, deployerWallet)
-	if err != nil {
-		return fmt.Errorf("failed to update deployer wallet: %w", err)
+	// Update all deployer wallets with chain info
+	for i, wallet := range s.deployerWallets {
+		err := client.UpdateWallet(ctx, wallet)
+		if err != nil {
+			return fmt.Errorf("failed to update deployer wallet %d: %w", i, err)
+		}
+
+		s.logger.Infof("Initialized deployer wallet %d - Address: %s, Nonce: %d, Balance: %s ETH",
+			i, 
+			wallet.GetAddress().Hex(), 
+			wallet.GetNonce(), 
+			new(big.Int).Div(wallet.GetBalance(), big.NewInt(1e18)).String())
 	}
-
-	s.deployerWallet = deployerWallet
-	s.deployerAddress = deployerWallet.GetAddress()
-
-	s.logger.Infof("Initialized deployer wallet - Address: %s, Nonce: %d, Balance: %s ETH",
-		s.deployerAddress.Hex(), 
-		deployerWallet.GetNonce(), 
-		new(big.Int).Div(deployerWallet.GetBalance(), big.NewInt(1e18)).String())
 	
 	return nil
 }
@@ -361,7 +384,7 @@ func (s *Scenario) initializeContractInstances(ctx context.Context) error {
 		return fmt.Errorf("no client available")
 	}
 
-	for _, contractAddr := range s.deployedContracts {
+	for _, contractAddr := range s.allContracts {
 		contractInstance, err := contract.NewContract(contractAddr, client.GetEthClient())
 		if err != nil {
 			return fmt.Errorf("failed to create contract instance for %s: %w", contractAddr.Hex(), err)
@@ -377,11 +400,13 @@ func (s *Scenario) Run(ctx context.Context) error {
 	s.logger.Infof("starting scenario: %s", ScenarioName)
 	defer s.logger.Infof("scenario %s finished.", ScenarioName)
 
-	// Initialize deployer wallet if needed
-	if s.deployerWallet == nil {
-		if err := s.initializeDeployerWallet(ctx); err != nil {
-			return err
-		}
+	// Initialize deployer wallets if needed
+	if len(s.deployerWallets) == 0 {
+		return fmt.Errorf("no deployer wallets available")
+	}
+	
+	if err := s.initializeDeployerWallets(ctx); err != nil {
+		return err
 	}
 
 	// Initialize contract instances
@@ -438,6 +463,12 @@ func (s *Scenario) processTransaction(ctx context.Context, txIdx uint64, onCompl
 		return nil, fmt.Errorf("no contracts available")
 	}
 
+	// Select next deployer wallet
+	deployerWallet := s.selectNextDeployerWallet()
+	if deployerWallet == nil {
+		return nil, fmt.Errorf("no deployer wallet available")
+	}
+
 	client := s.walletPool.GetClient(spamoor.SelectClientRoundRobin, 0, "")
 	if client == nil {
 		return nil, fmt.Errorf("no client available")
@@ -455,13 +486,13 @@ func (s *Scenario) processTransaction(ctx context.Context, txIdx uint64, onCompl
 	}
 
 	// Build transaction with multiple transfers
-	tx, recipients, err := s.buildMultiTransferTransaction(ctx, contractAddr, client)
+	tx, recipients, err := s.buildMultiTransferTransaction(ctx, contractAddr, deployerWallet, client)
 	if err != nil {
 		return nil, err
 	}
 
 	transactionSubmitted = true
-	err = s.walletPool.GetTxPool().SendTransaction(ctx, s.deployerWallet, tx, &spamoor.SendTransactionOptions{
+	err = s.walletPool.GetTxPool().SendTransaction(ctx, deployerWallet, tx, &spamoor.SendTransactionOptions{
 		Client:      client,
 		Rebroadcast: true,
 		OnComplete: func(tx *types.Transaction, receipt *types.Receipt, err error) {
@@ -490,7 +521,7 @@ func (s *Scenario) processTransaction(ctx context.Context, txIdx uint64, onCompl
 	})
 
 	if err != nil {
-		s.deployerWallet.ResetPendingNonce(ctx, client)
+		deployerWallet.ResetPendingNonce(ctx, client)
 	}
 
 	// Return logging function
@@ -504,7 +535,7 @@ func (s *Scenario) processTransaction(ctx context.Context, txIdx uint64, onCompl
 }
 
 // buildMultiTransferTransaction creates a transaction containing multiple transfers
-func (s *Scenario) buildMultiTransferTransaction(ctx context.Context, contractAddr common.Address, client *spamoor.Client) (*types.Transaction, []common.Address, error) {
+func (s *Scenario) buildMultiTransferTransaction(ctx context.Context, contractAddr common.Address, deployerWallet *spamoor.Wallet, client *spamoor.Client) (*types.Transaction, []common.Address, error) {
 	// Get suggested fees
 	feeCap, tipCap, err := s.walletPool.GetTxPool().GetSuggestedFees(client, s.options.BaseFee, s.options.TipFee)
 	if err != nil {
@@ -527,7 +558,7 @@ func (s *Scenario) buildMultiTransferTransaction(ctx context.Context, contractAd
 	gasLimit := uint64(BaseTransactionGas + BatchFunctionOverhead + (GasPerBatchTransfer * uint64(len(recipients))))
 
 	// Build transaction using BuildBoundTx with contract instance
-	tx, err := s.deployerWallet.BuildBoundTx(ctx, &txbuilder.TxMetadata{
+	tx, err := deployerWallet.BuildBoundTx(ctx, &txbuilder.TxMetadata{
 		GasFeeCap: uint256.MustFromBig(feeCap),
 		GasTipCap: uint256.MustFromBig(tipCap),
 		Gas:       gasLimit,
