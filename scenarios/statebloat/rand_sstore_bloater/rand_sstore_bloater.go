@@ -358,16 +358,16 @@ func (s *Scenario) Run(ctx context.Context) error {
 
 // runSingleTxPerBlock implements the custom loop for one transaction per block
 func (s *Scenario) runSingleTxPerBlock(ctx context.Context) error {
-	var txCount uint64
-	var walletIndex uint64
-	pendingTxs := make(map[common.Hash]*pendingTxInfo)
-	pendingTxsMutex := sync.Mutex{}
-	
 	type pendingTxInfo struct {
 		tx           *types.Transaction
 		slotsCreated uint64
 		sentAt       time.Time
 	}
+	
+	var txCount uint64
+	var walletIndex uint64
+	pendingTxs := make(map[common.Hash]*pendingTxInfo)
+	pendingTxsMutex := sync.Mutex{}
 	
 	// Start a goroutine to track transaction confirmations
 	go func() {
@@ -443,9 +443,9 @@ func (s *Scenario) runSingleTxPerBlock(ctx context.Context) error {
 			lastBlockNumber = currentBlockNumber
 			
 			// Get next wallet in rotation
-			wallet := s.walletPool.GetWallet(spamoor.SelectWalletByIndex, walletIndex)
+			wallet := s.walletPool.GetWallet(spamoor.SelectWalletByIndex, int(walletIndex))
 			if wallet == nil {
-				s.logger.Error("no wallet available at index %d", walletIndex)
+				s.logger.Errorf("no wallet available at index %d", walletIndex)
 				continue
 			}
 			walletIndex = (walletIndex + 1) % uint64(s.walletPool.GetWalletCount())
