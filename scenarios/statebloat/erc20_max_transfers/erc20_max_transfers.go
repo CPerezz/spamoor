@@ -681,8 +681,7 @@ func (s *Scenario) distributeTokensToChildWallets(ctx context.Context, childWall
 	
 	// Wait for all token transfers to confirm
 	s.logger.Info("Waiting for token distribution transactions to confirm...")
-	err = s.waitForTransactions(ctx, client, pendingTxs, "token distribution")
-	if err != nil {
+	if err := s.waitForTransactions(ctx, client, pendingTxs, "token distribution"); err != nil {
 		return err
 	}
 	
@@ -697,7 +696,7 @@ func (s *Scenario) distributeTokensToChildWallets(ctx context.Context, childWall
 
 // packTransferData packs the transfer function call data
 func (s *Scenario) packTransferData(to common.Address, amount *big.Int) []byte {
-	data, err := s.transferABI.Pack(to, amount)
+	data, err := s.contractABI.Pack("transfer", to, amount)
 	if err != nil {
 		// This should never happen with valid inputs
 		return nil
