@@ -555,16 +555,30 @@ func (s *Scenario) distributeTokensToChildWallets(ctx context.Context, childWall
 		walletsPerDeployer++
 	}
 	
-	s.logger.Infof("Distributing tokens: %d deployers will fund %d child wallets each",
+	s.logger.Infof("Distributing tokens: %d deployers will fund up to %d child wallets each",
 		len(s.deployerWallets), walletsPerDeployer)
 	
 	pendingTxs := make(map[common.Hash]*types.Transaction)
 	childIndex := 0
 	
-	// For each contract, distribute tokens to child wallets
-	for contractIdx, contractAddr := range s.allContracts {
-		// Select deployer wallet for this contract
-		deployerWallet := s.deployerWallets[contractIdx%len(s.deployerWallets)]
+	// Distribute child wallets among deployer wallets
+	for deployerIdx, deployerWallet := range s.deployerWallets {
+		// Find contracts owned by this deployer
+		var ownedContracts []common.Address
+		for privateKey, contracts := range s.deployedContracts {
+			// Check if this deployer wallet matches the private key
+			deployerPrivKey := deployerWallet.GetPrivateKey()
+			if deployerPrivKey != nil && deployerPrivKey.D.Text(16) == privateKey {
+				ownedContracts = append(ownedContracts, contracts...)
+			}
+		}
+		
+		if len(ownedContracts) == 0 {
+			continue // This deployer has no contracts
+		}
+		
+		// Use the first contract from this deployer for token transfers
+		contractAddr := ownedContracts[0]
 		contractInstance := s.contractInstances[contractAddr]
 		
 		// Send tokens to assigned child wallets
@@ -607,9 +621,14 @@ func (s *Scenario) distributeTokensToChildWallets(ctx context.Context, childWall
 			}
 		}
 		
-		// Break if all child wallets have been assigned
+		// Break if all child wallets have been funded
 		if childIndex >= len(childWallets) {
 			break
+		}
+		
+		// Log progress
+		if (deployerIdx+1)%10 == 0 {
+			s.logger.Debugf("Processed %d/%d deployer wallets", deployerIdx+1, len(s.deployerWallets))
 		}
 	}
 	
