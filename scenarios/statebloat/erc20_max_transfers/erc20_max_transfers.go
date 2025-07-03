@@ -14,6 +14,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -581,15 +582,52 @@ func (s *Scenario) distributeTokensToChildWallets(ctx context.Context, childWall
 		contractAddr := ownedContracts[0]
 		contractInstance := s.contractInstances[contractAddr]
 		
+		// Check deployer's token balance
+		deployerBalance, err := contractInstance.BalanceOf(nil, deployerWallet.GetAddress())
+		if err != nil {
+			s.logger.Warnf("Failed to check balance for deployer %s: %v", deployerWallet.GetAddress().Hex(), err)
+			continue
+		}
+		
+		// Calculate required tokens for this deployer
+		requiredTokens := new(big.Int).Mul(tokenAmount, big.NewInt(int64(walletsPerDeployer)))
+		if deployerBalance.Cmp(requiredTokens) < 0 {
+			s.logger.Warnf("Deployer %s has insufficient tokens: has %s, needs %s", 
+				deployerWallet.GetAddress().Hex(), 
+				deployerBalance.String(), 
+				requiredTokens.String())
+			// Try to send to as many child wallets as possible with available balance
+			possibleTransfers := new(big.Int).Div(deployerBalance, tokenAmount).Int64()
+			if possibleTransfers == 0 {
+				continue
+			}
+			walletsPerDeployer = int(possibleTransfers)
+			s.logger.Infof("Deployer %s will fund %d child wallets instead", deployerWallet.GetAddress().Hex(), walletsPerDeployer)
+		}
+		
 		// Send tokens to assigned child wallets
 		for i := 0; i < walletsPerDeployer && childIndex < len(childWallets); i++ {
 			childWallet := childWallets[childIndex]
-			childIndex++
 			
 			// Get suggested fees
 			feeCap, tipCap, err := s.walletPool.GetTxPool().GetSuggestedFees(client, baseFee, tipFee)
 			if err != nil {
-				return fmt.Errorf("failed to get suggested fees: %w", err)
+				s.logger.Warnf("Failed to get suggested fees: %v", err)
+				continue
+			}
+			
+			// Estimate gas for the transfer
+			estimatedGas := uint64(100000) // Default estimate
+			callMsg := ethereum.CallMsg{
+				From: deployerWallet.GetAddress(),
+				To:   &contractAddr,
+				Data: s.packTransferData(childWallet.GetAddress(), tokenAmount),
+			}
+			gasEstimate, err := client.GetEthClient().EstimateGas(ctx, callMsg)
+			if err == nil {
+				estimatedGas = uint64(float64(gasEstimate) * 1.2) // Add 20% buffer
+			} else {
+				s.logger.Debugf("Failed to estimate gas, using default: %v", err)
 			}
 			
 			// Build token transfer transaction
@@ -597,12 +635,13 @@ func (s *Scenario) distributeTokensToChildWallets(ctx context.Context, childWall
 				To:        &contractAddr,
 				GasFeeCap: uint256.MustFromBig(feeCap),
 				GasTipCap: uint256.MustFromBig(tipCap),
-				Gas:       100000, // Estimated gas for token transfer
+				Gas:       estimatedGas,
 			}, func(transactOpts *bind.TransactOpts) (*types.Transaction, error) {
 				return contractInstance.Transfer(transactOpts, childWallet.GetAddress(), tokenAmount)
 			})
 			if err != nil {
-				return fmt.Errorf("failed to build token transfer: %w", err)
+				s.logger.Warnf("Failed to build token transfer for child %d: %v", childIndex, err)
+				continue
 			}
 			
 			// Send transaction
@@ -611,8 +650,11 @@ func (s *Scenario) distributeTokensToChildWallets(ctx context.Context, childWall
 				Rebroadcast: true,
 			})
 			if err != nil {
-				return fmt.Errorf("failed to send tokens: %w", err)
+				s.logger.Warnf("Failed to send tokens to child %d: %v", childIndex, err)
+				continue
 			}
+			
+			childIndex++ // Only increment if send was attempted
 			
 			pendingTxs[tx.Hash()] = tx
 			
@@ -632,19 +674,48 @@ func (s *Scenario) distributeTokensToChildWallets(ctx context.Context, childWall
 		}
 	}
 	
+	// Check if we have any transactions to wait for
+	if len(pendingTxs) == 0 {
+		return fmt.Errorf("no token distribution transactions were sent successfully")
+	}
+	
 	// Wait for all token transfers to confirm
 	s.logger.Info("Waiting for token distribution transactions to confirm...")
-	return s.waitForTransactions(ctx, client, pendingTxs, "token distribution")
+	err = s.waitForTransactions(ctx, client, pendingTxs, "token distribution")
+	if err != nil {
+		return err
+	}
+	
+	// Ensure we have funded at least some child wallets
+	if childIndex == 0 {
+		return fmt.Errorf("failed to distribute tokens to any child wallets")
+	}
+	
+	s.logger.Infof("Successfully distributed tokens to %d child wallets", childIndex)
+	return nil
+}
+
+// packTransferData packs the transfer function call data
+func (s *Scenario) packTransferData(to common.Address, amount *big.Int) []byte {
+	data, err := s.transferABI.Pack(to, amount)
+	if err != nil {
+		// This should never happen with valid inputs
+		return nil
+	}
+	return data
 }
 
 // waitForTransactions waits for a set of transactions to be confirmed
 func (s *Scenario) waitForTransactions(ctx context.Context, client *spamoor.Client, pendingTxs map[common.Hash]*types.Transaction, txType string) error {
 	startTime := time.Now()
 	confirmed := 0
+	failed := 0
 	total := len(pendingTxs)
 	
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
+	
+	failedTxs := make([]string, 0)
 	
 	for len(pendingTxs) > 0 {
 		select {
@@ -656,27 +727,44 @@ func (s *Scenario) waitForTransactions(ctx context.Context, client *spamoor.Clie
 				if err == nil && receipt != nil {
 					if receipt.Status == types.ReceiptStatusSuccessful {
 						confirmed++
-						delete(pendingTxs, hash)
 					} else {
-						return fmt.Errorf("%s transaction failed: %s", txType, hash.Hex())
+						failed++
+						failedTxs = append(failedTxs, hash.Hex())
+						s.logger.Warnf("%s transaction failed: %s", txType, hash.Hex())
 					}
+					delete(pendingTxs, hash)
 				}
 			}
 			
-			if confirmed > 0 {
+			if confirmed > 0 || failed > 0 {
 				elapsed := time.Since(startTime)
-				s.logger.Infof("%s progress: %d/%d confirmed (%.1fs elapsed)",
-					txType, confirmed, total, elapsed.Seconds())
+				s.logger.Infof("%s progress: %d/%d confirmed, %d failed (%.1fs elapsed)",
+					txType, confirmed, total, failed, elapsed.Seconds())
 			}
 			
 			// Timeout after 5 minutes
 			if time.Since(startTime) > 5*time.Minute {
-				return fmt.Errorf("%s timeout: %d transactions still pending", txType, len(pendingTxs))
+				s.logger.Warnf("%s timeout: %d transactions still pending", txType, len(pendingTxs))
+				break
 			}
 		}
 	}
 	
-	s.logger.Infof("%s completed: all %d transactions confirmed", txType, total)
+	if failed > 0 {
+		s.logger.Warnf("%s completed with %d failures: %v", txType, failed, failedTxs)
+		// For token distribution, we can continue if some succeed
+		if txType == "token distribution" && confirmed > 0 {
+			s.logger.Infof("Continuing with %d successful token distributions", confirmed)
+			return nil
+		}
+		// For ETH funding, all must succeed
+		if txType == "ETH funding" {
+			return fmt.Errorf("%s had %d failures", txType, failed)
+		}
+	} else {
+		s.logger.Infof("%s completed: all %d transactions confirmed", txType, total)
+	}
+	
 	return nil
 }
 
