@@ -333,7 +333,7 @@ Comprehensive guide for implementing custom transaction scenarios. Covers:
 ## 🏗️ Development
 
 ### Prerequisites
-- Go 1.24+
+- Go 1.24+.
 - CGO enabled (required for SQLite and cryptographic operations)
 - Build tags: `with_blob_v1,ckzg` for blob transaction support
 
