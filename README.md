@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/github/license/ethpandaops/spamoor)](LICENSE)
 [![Docker](https://img.shields.io/docker/pulls/ethpandaops/spamoor)](https://hub.docker.com/r/ethpandaops/spamoor)
 
-Spamoor is a robust transaction spamming tool designed for stress testing, network validation, and continuous transaction testing on Ethereum testnets. With 14+ different transaction scenarios and a powerful web-based daemon mode, it's the ultimate tool for Ethereum network testing.
+Spamoor is a robust transaction spamming tool designed for stress testing, network validation, and continuous transaction testing on Ethereum testnets. With 14+ different transaction scenarios and a powerful web-based daemon mode, it's the ultimate tool for Ethereum network testing
 
 ## 🚀 Quick Start
 
