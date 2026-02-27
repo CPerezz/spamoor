@@ -185,11 +185,16 @@ func (s *Scenario) Run(ctx context.Context) error {
 				logger = logger.WithField("wallet", s.walletPool.GetWalletName(wallet.GetAddress()))
 			}
 
+			if err != nil {
+				params.OrderedLogCb(func() {
+					logger.Warnf("could not send transaction: %v", err)
+				})
+				return nil
+			}
+
 			params.NotifySubmitted()
 			params.OrderedLogCb(func() {
-				if err != nil {
-					logger.Warnf("could not send transaction: %v", err)
-				} else if s.options.LogTxs {
+				if s.options.LogTxs {
 					toAddr := s.getTargetAddress(params.TxIdx)
 					logger.Infof("sent tx #%6d: %v -> %v (amount: %d wei)", params.TxIdx+1, tx.Hash().String(), toAddr.Hex(), params.TxIdx+1)
 				} else {
@@ -201,7 +206,7 @@ func (s *Scenario) Run(ctx context.Context) error {
 				return err
 			}
 
-			return err
+			return nil
 		},
 	})
 
