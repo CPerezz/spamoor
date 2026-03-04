@@ -26,6 +26,7 @@ import (
 	"github.com/ethpandaops/spamoor/scenarios/geastx"
 	replayeest "github.com/ethpandaops/spamoor/scenarios/replay-eest"
 	"github.com/ethpandaops/spamoor/scenarios/setcodetx"
+	eoabloater "github.com/ethpandaops/spamoor/scenarios/statebloat/eoa_bloater"
 	erc20bloater "github.com/ethpandaops/spamoor/scenarios/statebloat/erc20_bloater"
 	extcodesizesetup "github.com/ethpandaops/spamoor/scenarios/statebloat/extcodesize_setup"
 	storagetriebrancher "github.com/ethpandaops/spamoor/scenarios/statebloat/storage_trie_brancher"
@@ -80,6 +81,7 @@ var nativeScenarioCategories = []*scenario.Category{
 		Name:        "Bloatnet",
 		Description: "Scenarios specifically designed for state bloating",
 		Descriptors: []*scenario.Descriptor{
+			&eoabloater.ScenarioDescriptor,
 			&erc20bloater.ScenarioDescriptor,
 			&extcodesizesetup.ScenarioDescriptor,
 			&storagetriebrancher.ScenarioDescriptor,
